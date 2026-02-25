@@ -1,0 +1,10 @@
+{
+  "id": "custom-sync",
+  "name": "Custom Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Self-hosted sync plugin scaffold for Obsidian.",
+  "author": "Nova",
+  "authorUrl": "https://example.com",
+  "isDesktopOnly": false
+}

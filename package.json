@@ -1,0 +1,16 @@
+{
+  "name": "obsidian-sync",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run -ws build",
+    "dev:api": "npm run --workspace @obsidian-sync/sync-api dev",
+    "dev:plugin": "npm run --workspace @obsidian-sync/plugin dev",
+    "migrate": "npm run --workspace @obsidian-sync/sync-api migrate",
+    "lint": "npm run -ws lint --if-present"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules
+dist
+.DS_Store
+.env
+.env.*
+*.log
+coverage
+.secrets/
+阿里云.txt
+reports/*
