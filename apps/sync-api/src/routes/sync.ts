@@ -78,6 +78,11 @@ interface ConflictItem {
   fileId?: string;
   path: string;
   message: string;
+  reason?: string;
+  headVersion?: number;
+  remotePath?: string;
+  remoteDeleted?: boolean;
+  existingFileId?: string;
 }
 
 interface UploadTarget {
@@ -113,6 +118,33 @@ async function getFileEntry(vaultId: string, fileId: string): Promise<FileEntryR
      WHERE vault_id = $1 AND id = $2
      LIMIT 1`,
     [vaultId, fileId]
+  );
+  return result.rows[0] ?? null;
+}
+
+async function getActiveFileEntryByPath(vaultId: string, path: string, ignoreFileId?: string): Promise<FileEntryRow | null> {
+  if (ignoreFileId) {
+    const result = await query<FileEntryRow>(
+      `SELECT id, current_path, head_version, deleted_at
+       FROM file_entries
+       WHERE vault_id = $1
+         AND current_path = $2
+         AND deleted_at IS NULL
+         AND id <> $3
+       LIMIT 1`,
+      [vaultId, path, ignoreFileId]
+    );
+    return result.rows[0] ?? null;
+  }
+
+  const result = await query<FileEntryRow>(
+    `SELECT id, current_path, head_version, deleted_at
+     FROM file_entries
+     WHERE vault_id = $1
+       AND current_path = $2
+       AND deleted_at IS NULL
+     LIMIT 1`,
+    [vaultId, path]
   );
   return result.rows[0] ?? null;
 }
@@ -346,12 +378,18 @@ export default function syncRoutes(objectStore: ObjectStore) {
         }
 
         if (change.op === "create") {
-          if (await pathOccupied(vaultId, change.path)) {
+          const occupiedEntry = await getActiveFileEntryByPath(vaultId, change.path);
+          if (occupiedEntry) {
             conflicts.push({
               index,
               code: "PATH_CONFLICT",
               path: change.path,
-              message: "path already exists"
+              message: "path already exists",
+              reason: "path_exists",
+              remotePath: occupiedEntry.current_path,
+              headVersion: occupiedEntry.head_version,
+              existingFileId: occupiedEntry.id,
+              remoteDeleted: false
             });
           }
           continue;
@@ -364,7 +402,11 @@ export default function syncRoutes(objectStore: ObjectStore) {
             code: "FILE_NOT_FOUND",
             fileId: change.fileId,
             path: change.path,
-            message: "file not found or deleted"
+            message: "file not found or deleted",
+            reason: fileEntry?.deleted_at ? "deleted_on_server" : "unknown_file_id",
+            remotePath: fileEntry?.current_path,
+            headVersion: fileEntry?.head_version,
+            remoteDeleted: Boolean(fileEntry?.deleted_at)
           });
           continue;
         }
@@ -375,18 +417,31 @@ export default function syncRoutes(objectStore: ObjectStore) {
             code: "VERSION_CONFLICT",
             fileId: change.fileId,
             path: change.path,
-            message: `baseVersion ${change.baseVersion} does not match headVersion ${fileEntry.head_version}`
+            message: `baseVersion ${change.baseVersion} does not match headVersion ${fileEntry.head_version}`,
+            reason: "base_version_mismatch",
+            headVersion: fileEntry.head_version,
+            remotePath: fileEntry.current_path,
+            remoteDeleted: false
           });
           continue;
         }
 
-        if ((change.op === "rename" || change.op === "move") && (await pathOccupied(vaultId, change.path, fileEntry.id))) {
+        const occupiedTarget =
+          change.op === "rename" || change.op === "move"
+            ? await getActiveFileEntryByPath(vaultId, change.path, fileEntry.id)
+            : null;
+        if (occupiedTarget) {
           conflicts.push({
             index,
             code: "PATH_CONFLICT",
             fileId: change.fileId,
             path: change.path,
-            message: "target path already exists"
+            message: "target path already exists",
+            reason: "target_path_exists",
+            remotePath: occupiedTarget.current_path,
+            headVersion: occupiedTarget.head_version,
+            existingFileId: occupiedTarget.id,
+            remoteDeleted: false
           });
         }
       }

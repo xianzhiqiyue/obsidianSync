@@ -38,6 +38,11 @@ export interface SyncConflict {
   fileId?: string;
   path: string;
   message: string;
+  reason?: string;
+  headVersion?: number;
+  remotePath?: string;
+  remoteDeleted?: boolean;
+  existingFileId?: string;
 }
 
 export interface UploadTarget {

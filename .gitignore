@@ -8,3 +8,4 @@ coverage
 .secrets/
 阿里云.txt
 reports/*
+releases/*

@@ -8,11 +8,23 @@ import {
   SyncApiError
 } from "./api-client";
 import {
+  openConflictResolutionModal,
+  type ConflictResolutionAction,
+  type ConflictResolutionCandidate
+} from "./conflict-resolution-modal";
+import {
   DEFAULT_LOCAL_SYNC_STATE,
   LocalStateStore,
   type IndexedFileState,
-  type LocalSyncState
+  type LocalSyncState,
+  type PendingConflictSummary
 } from "./state-store";
+import { pruneMissingFileIndexEntries, shouldCreateConflictCopy } from "./sync-conflicts";
+import {
+  buildConflictResolutionCandidate,
+  buildConflictResolutionId,
+  createTextPreview
+} from "./sync-conflict-candidates";
 import { buildLocalPlan, normalizeQueuedChanges, type LocalFileSnapshot } from "./sync-planner";
 import { shouldNotifyBlocked, shouldNotifyFailure } from "./sync-notify";
 import { runWithRetry } from "./sync-retry";
@@ -70,6 +82,13 @@ const REMOTE_CHANGE_BATCH_SIZE = 20;
 
 type SyncRunResult = "idle" | "success" | "failed" | "blocked" | "skipped";
 
+class SyncConflictResolutionRequiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SyncConflictResolutionRequiredError";
+  }
+}
+
 export default class CustomSyncPlugin extends Plugin {
   settings: SyncPluginSettings = { ...DEFAULT_SETTINGS };
   authState: AuthState = { ...DEFAULT_AUTH_STATE };
@@ -114,6 +133,16 @@ export default class CustomSyncPlugin extends Plugin {
       id: "custom-sync-clear-failure-state",
       name: "清除同步失败状态",
       callback: () => void this.clearFailureState()
+    });
+    this.addCommand({
+      id: "custom-sync-resolve-pending-conflicts",
+      name: "处理待决冲突",
+      callback: () => void this.runSyncOnce("manual-command")
+    });
+    this.addCommand({
+      id: "custom-sync-clear-pending-conflicts",
+      name: "清除待决冲突",
+      callback: () => void this.clearPendingConflicts()
     });
 
     this.setupTimer();
@@ -194,6 +223,11 @@ export default class CustomSyncPlugin extends Plugin {
     new Notice("已清除同步失败状态。");
   }
 
+  async clearPendingConflicts(): Promise<void> {
+    await this.stateStore.clearPendingConflicts();
+    new Notice("已清除待决冲突。");
+  }
+
   private async runSyncWithRetry(reason: string): Promise<void> {
     if (!this.settings.vaultId) {
       this.lastSyncResult = "skipped";
@@ -215,6 +249,13 @@ export default class CustomSyncPlugin extends Plugin {
       return;
     }
 
+    const pendingConflicts = this.stateStore.getPendingConflicts();
+    if (pendingConflicts.items.length > 0 && !this.isInteractiveTrigger(reason)) {
+      this.lastSyncResult = "skipped";
+      this.lastSyncError = `存在 ${pendingConflicts.items.length} 个待处理冲突`;
+      return;
+    }
+
     const result = await runWithRetry({
       maxAttempts: 3,
       timeoutMs: SYNC_ATTEMPT_TIMEOUT_MS,
@@ -227,18 +268,30 @@ export default class CustomSyncPlugin extends Plugin {
         await this.sleep(ms);
       },
       onAttemptFailure: async (failure) => {
+        if (failure.error instanceof SyncConflictResolutionRequiredError) {
+          return;
+        }
         await this.stateStore.recordFailure(failure.message, failure.retryable);
       }
     });
 
     if (result.status === "success") {
       await this.stateStore.clearFailureState();
+      await this.stateStore.clearPendingConflicts();
       this.lastSyncResult = "success";
       this.lastSyncError = null;
       return;
     }
 
     if (result.lastFailure) {
+      if (result.lastFailure.error instanceof SyncConflictResolutionRequiredError) {
+        this.lastSyncResult = "skipped";
+        this.lastSyncError = result.lastFailure.message;
+        if (this.isInteractiveTrigger(reason)) {
+          new Notice(result.lastFailure.message);
+        }
+        return;
+      }
       this.lastSyncResult = "failed";
       this.lastSyncError = result.lastFailure.message;
       const failureState = this.stateStore.getFailureState();
@@ -255,7 +308,10 @@ export default class CustomSyncPlugin extends Plugin {
     this.lastSyncError = "同步失败";
   }
 
-  private async runSyncOnceInternal(signal: AbortSignal): Promise<void> {
+  private async runSyncOnceInternal(signal: AbortSignal, resolutionDepth = 0): Promise<void> {
+    if (resolutionDepth > 2) {
+      throw new Error("冲突处理重试次数过多，请稍后重试。");
+    }
     this.throwIfAborted(signal);
     const client = this.getApiClient();
     const token = await this.ensureAccessToken(signal);
@@ -278,8 +334,19 @@ export default class CustomSyncPlugin extends Plugin {
       this.throwIfAborted(signal);
       const prepare = await client.prepare(token, this.settings.vaultId, initialCheckpoint, localPlan.changes, signal);
       if (prepare.conflicts.length > 0) {
-        await this.handlePrepareConflicts(localPlan, prepare.conflicts, signal);
-        throw new Error(`同步预检查存在冲突：${prepare.conflicts.map((item) => item.code).join(", ")}`);
+        const resolution = await this.resolvePrepareConflicts(
+          client,
+          token,
+          currentIndex,
+          localPlan,
+          prepare.conflicts,
+          signal
+        );
+        if (resolution === "retry") {
+          await this.runSyncOnceInternal(signal, resolutionDepth + 1);
+          return;
+        }
+        throw new SyncConflictResolutionRequiredError(`存在 ${prepare.conflicts.length} 个冲突待处理。`);
       }
 
       await this.uploadTargetsWithConcurrency(client, prepare.uploadTargets, localPlan.hashToSnapshot, signal);
@@ -393,6 +460,11 @@ export default class CustomSyncPlugin extends Plugin {
             data?.state?.failure?.consecutiveFailures ?? DEFAULT_LOCAL_SYNC_STATE.failure.consecutiveFailures,
           blocked: data?.state?.failure?.blocked ?? DEFAULT_LOCAL_SYNC_STATE.failure.blocked,
           lastFailedAt: data?.state?.failure?.lastFailedAt ?? DEFAULT_LOCAL_SYNC_STATE.failure.lastFailedAt
+        },
+        pendingConflicts: {
+          items: data?.state?.pendingConflicts?.items ?? DEFAULT_LOCAL_SYNC_STATE.pendingConflicts.items,
+          deferredAt:
+            data?.state?.pendingConflicts?.deferredAt ?? DEFAULT_LOCAL_SYNC_STATE.pendingConflicts.deferredAt
         }
       },
       auth: {
@@ -611,6 +683,9 @@ export default class CustomSyncPlugin extends Plugin {
       if (!change) {
         continue;
       }
+      if (!shouldCreateConflictCopy(change.path, conflict)) {
+        continue;
+      }
 
       let bytes: ArrayBuffer | null = null;
       if (change.contentHash) {
@@ -636,6 +711,143 @@ export default class CustomSyncPlugin extends Plugin {
 
     if (copiedCount > 0) {
       new Notice(`已生成 ${copiedCount} 个冲突副本文件。`);
+    }
+  }
+
+  private async resolvePrepareConflicts(
+    client: SyncApiClient,
+    accessToken: string,
+    currentIndex: Record<string, IndexedFileState>,
+    localPlan: { changes: SyncChangeRequest[]; hashToSnapshot: Record<string, LocalFileSnapshot> },
+    conflicts: SyncConflict[],
+    signal: AbortSignal
+  ): Promise<"retry" | "deferred"> {
+    const repairedIndex = pruneMissingFileIndexEntries(currentIndex, localPlan.changes, conflicts);
+    if (repairedIndex !== currentIndex) {
+      await this.stateStore.replaceFileIndexByPath(repairedIndex);
+    }
+
+    const candidates = this.buildConflictResolutionCandidates(localPlan, conflicts);
+    const modalResult = await openConflictResolutionModal(this.app, candidates);
+    const pendingSummaries = candidates.map<PendingConflictSummary>((item) => ({
+      id: item.id,
+      code: item.code,
+      path: item.path,
+      fileId: item.fileId,
+      message: item.message
+    }));
+
+    if (modalResult.action === "defer" || Object.values(modalResult.selections).some((value) => value === "defer")) {
+      await this.stateStore.setPendingConflicts(pendingSummaries);
+      return "deferred";
+    }
+
+    await this.stateStore.clearPendingConflicts();
+    const localRestores = await this.collectLocalRestores(localPlan, conflicts, candidates, modalResult.selections, signal);
+    await this.rebaseToRemoteState(client, accessToken, signal);
+
+    for (const restore of localRestores) {
+      await this.writeLocalFile(restore.path, restore.bytes, signal);
+    }
+
+    return "retry";
+  }
+
+  private buildConflictResolutionCandidates(
+    localPlan: { changes: SyncChangeRequest[]; hashToSnapshot: Record<string, LocalFileSnapshot> },
+    conflicts: SyncConflict[]
+  ): ConflictResolutionCandidate[] {
+    return conflicts.map((conflict) => {
+      const change = localPlan.changes[conflict.index];
+      const path = change?.path ?? conflict.path;
+      const localFile = this.app.vault.getAbstractFileByPath(path);
+      const previewBytes =
+        (change?.contentHash ? localPlan.hashToSnapshot[change.contentHash]?.bytes : undefined) ?? null;
+      return buildConflictResolutionCandidate(conflict, localPlan, {
+        exists: localFile instanceof TFile,
+        isConflictCopy: path.includes(".conflict-"),
+        previewText: previewBytes ? createTextPreview(previewBytes) : null
+      });
+    });
+  }
+
+  private getConflictResolutionId(conflict: SyncConflict, path: string): string {
+    return buildConflictResolutionId(conflict, path);
+  }
+
+  private async collectLocalRestores(
+    localPlan: { changes: SyncChangeRequest[]; hashToSnapshot: Record<string, LocalFileSnapshot> },
+    conflicts: SyncConflict[],
+    candidates: ConflictResolutionCandidate[],
+    selections: Record<string, ConflictResolutionAction>,
+    signal: AbortSignal
+  ): Promise<Array<{ path: string; bytes: ArrayBuffer }>> {
+    const candidateById = new Map(candidates.map((item) => [item.id, item]));
+    const restores: Array<{ path: string; bytes: ArrayBuffer }> = [];
+
+    for (const conflict of conflicts) {
+      const change = localPlan.changes[conflict.index];
+      if (!change) {
+        continue;
+      }
+
+      const resolutionId = this.getConflictResolutionId(conflict, change.path);
+      if (selections[resolutionId] !== "use_local") {
+        continue;
+      }
+
+      const candidate = candidateById.get(resolutionId);
+      if (candidate?.localIsConflictCopy && conflict.code === "FILE_NOT_FOUND") {
+        continue;
+      }
+
+      let bytes: ArrayBuffer | null = null;
+      if (change.contentHash) {
+        bytes = localPlan.hashToSnapshot[change.contentHash]?.bytes ?? null;
+      }
+
+      if (!bytes) {
+        const existing = this.app.vault.getAbstractFileByPath(change.path);
+        if (existing instanceof TFile) {
+          bytes = await this.app.vault.readBinary(existing);
+        }
+      }
+
+      if (!bytes) {
+        continue;
+      }
+
+      restores.push({ path: change.path, bytes });
+      this.throwIfAborted(signal);
+    }
+
+    return restores;
+  }
+
+  private async rebaseToRemoteState(
+    client: SyncApiClient,
+    accessToken: string,
+    signal: AbortSignal
+  ): Promise<void> {
+    await this.stateStore.clearQueue();
+    await this.stateStore.replaceFileIndexByPath({});
+    await this.stateStore.setCheckpoint(null);
+
+    let nextCheckpoint = 0;
+    let updatedIndex: Record<string, IndexedFileState> = {};
+    while (true) {
+      this.throwIfAborted(signal);
+      const pulled = await client.pull(accessToken, this.settings.vaultId, nextCheckpoint, 200, signal);
+      if (pulled.changes.length > 0) {
+        updatedIndex = await this.applyRemoteChanges(client, accessToken, updatedIndex, pulled.changes, signal);
+        await this.stateStore.replaceFileIndexByPath(updatedIndex);
+      }
+
+      await this.stateStore.setCheckpoint(pulled.toCheckpoint);
+      nextCheckpoint = this.checkpointToNumber(pulled.toCheckpoint);
+      if (!pulled.hasMore) {
+        break;
+      }
     }
   }
 
@@ -758,6 +970,9 @@ export default class CustomSyncPlugin extends Plugin {
     }
 
     if (error instanceof Error) {
+      if (error instanceof SyncConflictResolutionRequiredError) {
+        return false;
+      }
       const message = error.message.toLowerCase();
       if (message.includes("failed to fetch") || message.includes("network") || message.includes("timed out")) {
         return true;
@@ -917,6 +1132,7 @@ export default class CustomSyncPlugin extends Plugin {
       `最近开始=${this.formatTime(this.lastSyncStartedAtMs)} 最近结束=${this.formatTime(this.lastSyncFinishedAtMs)}`,
       `检查点=${snapshot.checkpoint ?? "-"}`,
       `队列长度=${snapshot.queue.length} 失败队列长度=${failure.failedQueue.length}`,
+      `待处理冲突=${snapshot.pendingConflicts.items.length} 延后时间=${this.formatTime(snapshot.pendingConflicts.deferredAt)}`,
       `失败阻塞=${failure.blocked ? "是" : "否"} 连续失败=${failure.consecutiveFailures}`,
       `最近失败时间=${this.formatTime(failure.lastFailedAt)} 错误=${this.lastSyncError ?? failure.lastError ?? "-"}`
     ].join("\n");
@@ -1068,18 +1284,63 @@ class SyncSettingTab extends PluginSettingTab {
     };
     refreshStatus();
 
+    const pendingContainer = statusContainer.createDiv();
+    const refreshPendingConflicts = () => {
+      pendingContainer.empty();
+      const pendingConflicts = this.plugin.stateStore.getPendingConflicts();
+      pendingContainer.createEl("h4", { text: "待决冲突" });
+      if (pendingConflicts.items.length === 0) {
+        pendingContainer.createEl("p", { text: "当前没有待处理冲突。" });
+        return;
+      }
+
+      pendingContainer.createEl("p", {
+        text: `共 ${pendingConflicts.items.length} 项，延后时间：${
+          pendingConflicts.deferredAt ? new Date(pendingConflicts.deferredAt).toLocaleString() : "-"
+        }`
+      });
+      const list = pendingContainer.createEl("ul");
+      for (const item of pendingConflicts.items.slice(0, 10)) {
+        list.createEl("li", {
+          text: `${item.code} · ${item.path}${item.fileId ? ` · ${item.fileId}` : ""}`
+        });
+      }
+      if (pendingConflicts.items.length > 10) {
+        pendingContainer.createEl("p", {
+          text: `其余 ${pendingConflicts.items.length - 10} 项未展开。`
+        });
+      }
+    };
+    refreshPendingConflicts();
+
     new Setting(statusContainer)
       .setName("状态操作")
       .setDesc("刷新当前状态或触发一次同步。")
       .addButton((button) =>
         button.setButtonText("刷新状态").onClick(() => {
           refreshStatus();
+          refreshPendingConflicts();
         })
       )
       .addButton((button) =>
         button.setButtonText("同步并刷新").onClick(async () => {
           await this.plugin.runSyncOnce("settings-button");
           refreshStatus();
+          refreshPendingConflicts();
+        })
+      )
+      .addButton((button) =>
+        button.setButtonText("处理待决冲突").onClick(async () => {
+          await this.plugin.runSyncOnce("manual-command");
+          refreshStatus();
+          refreshPendingConflicts();
+        })
+      )
+      .addButton((button) =>
+        button.setButtonText("清除待决冲突").onClick(async () => {
+          await this.plugin.clearPendingConflicts();
+          refreshStatus();
+          refreshPendingConflicts();
         })
       );
 
@@ -1094,6 +1355,16 @@ class SyncSettingTab extends PluginSettingTab {
       .addButton((button) =>
         button.setButtonText("执行一次同步").onClick(async () => {
           await this.plugin.runSyncOnce("settings-button");
+        })
+      )
+      .addButton((button) =>
+        button.setButtonText("处理待决冲突").onClick(async () => {
+          await this.plugin.runSyncOnce("manual-command");
+        })
+      )
+      .addButton((button) =>
+        button.setButtonText("清除待决冲突").onClick(async () => {
+          await this.plugin.clearPendingConflicts();
         })
       )
       .addButton((button) =>

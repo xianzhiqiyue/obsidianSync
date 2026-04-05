@@ -17,7 +17,14 @@ interface CommitResponse {
 interface PrepareResponse {
   prepareId: string;
   uploadTargets: Array<{ contentHash: string; uploadUrl: string }>;
-  conflicts: Array<{ code: string }>;
+  conflicts: Array<{
+    code: string;
+    reason?: string;
+    headVersion?: number;
+    remotePath?: string;
+    remoteDeleted?: boolean;
+    existingFileId?: string;
+  }>;
 }
 
 interface SyncErrorResponse {
@@ -266,6 +273,129 @@ test("sync commit should reject conflicted prepare", async () => {
   } finally {
     await destroyTestContext(context);
     await cleanupObjectHashes([contentHashCreate, contentHashUpdate]);
+  }
+});
+
+test("sync prepare should return rich metadata for deleted and version conflicts", async () => {
+  const contentHashCreate = `sha256:test-rich-create-${randomUUID()}`;
+  const contentHashUpdate = `sha256:test-rich-update-${randomUUID()}`;
+  const existingHashes = new Set([contentHashCreate, contentHashUpdate]);
+  const context = await createTestContext(existingHashes);
+  try {
+    const path = `notes/rich-${randomUUID()}.md`;
+    const prepareCreateRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+      headers: {
+        authorization: `Bearer ${context.accessToken}`
+      },
+      payload: {
+        baseCheckpoint: 0,
+        changes: [{ op: "create", path, contentHash: contentHashCreate }]
+      }
+    });
+    const createBody = prepareCreateRes.json() as PrepareResponse;
+
+    const commitCreateRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: { prepareId: createBody.prepareId, idempotencyKey: randomUUID() }
+    });
+    assert.equal(commitCreateRes.statusCode, 200);
+
+    const fileResult = await query<{ id: string }>(
+      `SELECT id
+       FROM file_entries
+       WHERE vault_id = $1 AND current_path = $2
+       LIMIT 1`,
+      [context.vaultId, path]
+    );
+    const fileId = fileResult.rows[0]?.id;
+    assert.ok(fileId);
+
+    await query(
+      `UPDATE file_entries
+       SET head_version = 2, deleted_at = NOW()
+       WHERE id = $1`,
+      [fileId]
+    );
+
+    const deletedPrepareRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: {
+        baseCheckpoint: 1,
+        changes: [{ op: "update", fileId, path, baseVersion: 1, contentHash: contentHashUpdate }]
+      }
+    });
+    assert.equal(deletedPrepareRes.statusCode, 200);
+    const deletedPrepare = deletedPrepareRes.json() as PrepareResponse;
+    assert.equal(deletedPrepare.conflicts[0]?.code, "FILE_NOT_FOUND");
+    assert.equal(deletedPrepare.conflicts[0]?.reason, "deleted_on_server");
+    assert.equal(deletedPrepare.conflicts[0]?.remotePath, path);
+    assert.equal(deletedPrepare.conflicts[0]?.headVersion, 2);
+    assert.equal(deletedPrepare.conflicts[0]?.remoteDeleted, true);
+  } finally {
+    await destroyTestContext(context);
+    await cleanupObjectHashes([contentHashCreate, contentHashUpdate]);
+  }
+});
+
+test("sync prepare should return rich metadata for target path conflicts", async () => {
+  const hashA = `sha256:test-path-a-${randomUUID()}`;
+  const hashB = `sha256:test-path-b-${randomUUID()}`;
+  const existingHashes = new Set([hashA, hashB]);
+  const context = await createTestContext(existingHashes);
+  try {
+    const pathA = `notes/a-${randomUUID()}.md`;
+    const pathB = `notes/b-${randomUUID()}.md`;
+    for (const [path, hash] of [
+      [pathA, hashA],
+      [pathB, hashB]
+    ] as const) {
+      const prepareRes = await context.app.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+        headers: { authorization: `Bearer ${context.accessToken}` },
+        payload: { baseCheckpoint: 0, changes: [{ op: "create", path, contentHash: hash }] }
+      });
+      const prepareBody = prepareRes.json() as PrepareResponse;
+      await context.app.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+        headers: { authorization: `Bearer ${context.accessToken}` },
+        payload: { prepareId: prepareBody.prepareId, idempotencyKey: randomUUID() }
+      });
+    }
+
+    const fileAResult = await query<{ id: string }>(
+      `SELECT id FROM file_entries WHERE vault_id = $1 AND current_path = $2 LIMIT 1`,
+      [context.vaultId, pathA]
+    );
+    const fileAId = fileAResult.rows[0]?.id;
+    assert.ok(fileAId);
+
+    const conflictPrepareRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: {
+        baseCheckpoint: 2,
+        changes: [{ op: "rename", fileId: fileAId, path: pathB, baseVersion: 1 }]
+      }
+    });
+    assert.equal(conflictPrepareRes.statusCode, 200);
+    const conflictPrepare = conflictPrepareRes.json() as PrepareResponse;
+    assert.equal(conflictPrepare.conflicts[0]?.code, "PATH_CONFLICT");
+    assert.equal(conflictPrepare.conflicts[0]?.reason, "target_path_exists");
+    assert.equal(conflictPrepare.conflicts[0]?.remotePath, pathB);
+    assert.equal(conflictPrepare.conflicts[0]?.remoteDeleted, false);
+    assert.match(conflictPrepare.conflicts[0]?.existingFileId ?? "", /^[0-9a-f-]{36}$/i);
+  } finally {
+    await destroyTestContext(context);
+    await cleanupObjectHashes([hashA, hashB]);
   }
 });
 

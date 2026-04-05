@@ -24,11 +24,25 @@ export interface SyncFailureState {
   lastFailedAt: number | null;
 }
 
+export interface PendingConflictSummary {
+  id: string;
+  code: string;
+  path: string;
+  fileId?: string;
+  message: string;
+}
+
+export interface PendingConflictState {
+  items: PendingConflictSummary[];
+  deferredAt: number | null;
+}
+
 export interface LocalSyncState {
   checkpoint: string | null;
   queue: QueuedChange[];
   fileIndexByPath: Record<string, IndexedFileState>;
   failure: SyncFailureState;
+  pendingConflicts: PendingConflictState;
 }
 
 const DEFAULT_FAILURE_STATE: SyncFailureState = {
@@ -39,18 +53,28 @@ const DEFAULT_FAILURE_STATE: SyncFailureState = {
   lastFailedAt: null
 };
 
+const DEFAULT_PENDING_CONFLICT_STATE: PendingConflictState = {
+  items: [],
+  deferredAt: null
+};
+
 export const DEFAULT_LOCAL_SYNC_STATE: LocalSyncState = {
   checkpoint: null,
   queue: [],
   fileIndexByPath: {},
-  failure: DEFAULT_FAILURE_STATE
+  failure: DEFAULT_FAILURE_STATE,
+  pendingConflicts: DEFAULT_PENDING_CONFLICT_STATE
 };
 
 export class LocalStateStore {
   private state: LocalSyncState;
   private readonly onChange: (state: LocalSyncState) => Promise<void>;
 
-  constructor(initialState: LocalSyncState, onChange: (state: LocalSyncState) => Promise<void>) {
+  constructor(
+    initialState: LocalSyncState | (Omit<LocalSyncState, "pendingConflicts"> & { pendingConflicts?: PendingConflictState }),
+    onChange: (state: LocalSyncState) => Promise<void>
+  ) {
+    const pendingConflicts = initialState.pendingConflicts ?? DEFAULT_PENDING_CONFLICT_STATE;
     this.state = {
       checkpoint: initialState.checkpoint,
       queue: initialState.queue.map((item) => ({ ...item })),
@@ -61,6 +85,10 @@ export class LocalStateStore {
         consecutiveFailures: initialState.failure.consecutiveFailures,
         blocked: initialState.failure.blocked,
         lastFailedAt: initialState.failure.lastFailedAt
+      },
+      pendingConflicts: {
+        items: pendingConflicts.items.map((item) => ({ ...item })),
+        deferredAt: pendingConflicts.deferredAt
       }
     };
     this.onChange = onChange;
@@ -77,6 +105,10 @@ export class LocalStateStore {
         consecutiveFailures: this.state.failure.consecutiveFailures,
         blocked: this.state.failure.blocked,
         lastFailedAt: this.state.failure.lastFailedAt
+      },
+      pendingConflicts: {
+        items: this.state.pendingConflicts.items.map((item) => ({ ...item })),
+        deferredAt: this.state.pendingConflicts.deferredAt
       }
     };
   }
@@ -142,6 +174,28 @@ export class LocalStateStore {
   async clearFailureState(): Promise<void> {
     this.state.failure = {
       ...DEFAULT_FAILURE_STATE
+    };
+    await this.flush();
+  }
+
+  getPendingConflicts(): PendingConflictState {
+    return {
+      items: this.state.pendingConflicts.items.map((item) => ({ ...item })),
+      deferredAt: this.state.pendingConflicts.deferredAt
+    };
+  }
+
+  async setPendingConflicts(items: PendingConflictSummary[], deferredAt = Date.now()): Promise<void> {
+    this.state.pendingConflicts = {
+      items: items.map((item) => ({ ...item })),
+      deferredAt
+    };
+    await this.flush();
+  }
+
+  async clearPendingConflicts(): Promise<void> {
+    this.state.pendingConflicts = {
+      ...DEFAULT_PENDING_CONFLICT_STATE
     };
     await this.flush();
   }
