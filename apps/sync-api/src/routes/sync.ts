@@ -307,6 +307,20 @@ async function fetchLatestContentHash(client: { query: typeof query }, fileId: s
   return version.content_hash;
 }
 
+async function isNoopUpdate(vaultId: string, change: SyncChangeInput): Promise<boolean> {
+  if (change.op !== "update" || !change.fileId || !change.contentHash) {
+    return false;
+  }
+
+  const fileEntry = await getFileEntry(vaultId, change.fileId);
+  if (!fileEntry || fileEntry.deleted_at || fileEntry.current_path !== change.path) {
+    return false;
+  }
+
+  const latestContentHash = await fetchLatestContentHash({ query }, change.fileId);
+  return latestContentHash === change.contentHash;
+}
+
 function parseVaultParams(
   request: { params: unknown },
   reply: { code: (statusCode: number) => { send: (payload: unknown) => unknown } }
@@ -368,6 +382,7 @@ export default function syncRoutes(objectStore: ObjectStore) {
         });
       }
 
+      const normalizedChanges: SyncChangeInput[] = [];
       const conflicts: ConflictItem[] = [];
       for (let index = 0; index < parsed.data.changes.length; index += 1) {
         const change = parsed.data.changes[index]!;
@@ -391,7 +406,9 @@ export default function syncRoutes(objectStore: ObjectStore) {
               existingFileId: occupiedEntry.id,
               remoteDeleted: false
             });
+            continue;
           }
+          normalizedChanges.push(change);
           continue;
         }
 
@@ -408,6 +425,10 @@ export default function syncRoutes(objectStore: ObjectStore) {
             headVersion: fileEntry?.head_version,
             remoteDeleted: Boolean(fileEntry?.deleted_at)
           });
+          continue;
+        }
+
+        if (await isNoopUpdate(vaultId, change)) {
           continue;
         }
 
@@ -443,10 +464,13 @@ export default function syncRoutes(objectStore: ObjectStore) {
             existingFileId: occupiedTarget.id,
             remoteDeleted: false
           });
+          continue;
         }
+
+        normalizedChanges.push(change);
       }
 
-      const uploadTargets = await resolveUploadTargets(parsed.data.changes, objectStore);
+      const uploadTargets = await resolveUploadTargets(normalizedChanges, objectStore);
       const status = conflicts.length > 0 ? "conflicted" : "prepared";
       metricsRegistry.incCounter("sync_api_sync_prepare_total", { result: status });
       if (conflicts.length > 0) {
@@ -462,7 +486,7 @@ export default function syncRoutes(objectStore: ObjectStore) {
           vaultId,
           auth.deviceId,
           parsed.data.baseCheckpoint,
-          JSON.stringify(parsed.data.changes),
+          JSON.stringify(normalizedChanges),
           JSON.stringify(conflicts),
           status,
           expiresAt
@@ -538,6 +562,22 @@ export default function syncRoutes(objectStore: ObjectStore) {
 
       try {
         const changes = prepare.changes_json as SyncChangeInput[];
+        if (changes.length === 0) {
+          const currentCheckpoint = await ensureCheckpointRow(vaultId);
+          await query("UPDATE sync_prepares SET status = 'committed' WHERE id = $1", [prepare.id]);
+          const responseBody = {
+            changesetId: prepare.id,
+            newCheckpoint: `cp_${currentCheckpoint}`,
+            appliedChanges: 0
+          };
+          await query(
+            `INSERT INTO idempotency_keys (vault_id, idempotency_key, response_json)
+             VALUES ($1, $2, $3::jsonb)`,
+            [vaultId, parsed.data.idempotencyKey, JSON.stringify(responseBody)]
+          );
+          metricsRegistry.incCounter("sync_api_sync_commit_total", { result: "success" });
+          return reply.send(responseBody);
+        }
         const requiredObjectHashes = collectRequiredObjectHashes(changes);
         await ensureUploadedObjectsExist(requiredObjectHashes, objectStore);
 

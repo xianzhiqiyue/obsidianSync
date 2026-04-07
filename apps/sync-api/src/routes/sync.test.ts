@@ -399,6 +399,98 @@ test("sync prepare should return rich metadata for target path conflicts", async
   }
 });
 
+test("sync prepare should treat identical stale update as no-op instead of conflict", async () => {
+  const originalHash = `sha256:test-noop-original-${randomUUID()}`;
+  const updateHash = `sha256:test-noop-update-${randomUUID()}`;
+  const existingHashes = new Set([originalHash, updateHash]);
+  const context = await createTestContext(existingHashes);
+  try {
+    const path = `notes/noop-${randomUUID()}.md`;
+    const prepareCreateRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: {
+        baseCheckpoint: 0,
+        changes: [{ op: "create", path, contentHash: originalHash }]
+      }
+    });
+    assert.equal(prepareCreateRes.statusCode, 200);
+    const createBody = prepareCreateRes.json() as PrepareResponse;
+
+    const commitCreateRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: { prepareId: createBody.prepareId, idempotencyKey: randomUUID() }
+    });
+    assert.equal(commitCreateRes.statusCode, 200);
+
+    const fileResult = await query<{ id: string }>(
+      `SELECT id
+       FROM file_entries
+       WHERE vault_id = $1
+         AND current_path = $2
+       LIMIT 1`,
+      [context.vaultId, path]
+    );
+    const fileId = fileResult.rows[0]?.id;
+    assert.ok(fileId, "missing created file id");
+
+    const prepareRealUpdateRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: {
+        baseCheckpoint: 1,
+        changes: [{ op: "update", fileId, path, baseVersion: 1, contentHash: updateHash }]
+      }
+    });
+    const realUpdateBody = prepareRealUpdateRes.json() as PrepareResponse;
+    const commitRealUpdateRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: { prepareId: realUpdateBody.prepareId, idempotencyKey: randomUUID() }
+    });
+    assert.equal(commitRealUpdateRes.statusCode, 200);
+
+    const noopPrepareRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: {
+        baseCheckpoint: 1,
+        changes: [{ op: "update", fileId, path, baseVersion: 1, contentHash: updateHash }]
+      }
+    });
+    assert.equal(noopPrepareRes.statusCode, 200);
+    const noopPrepareBody = noopPrepareRes.json() as PrepareResponse;
+    assert.deepEqual(noopPrepareBody.conflicts, []);
+    assert.deepEqual(noopPrepareBody.uploadTargets, []);
+
+    const noopCommitRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: { prepareId: noopPrepareBody.prepareId, idempotencyKey: randomUUID() }
+    });
+    assert.equal(noopCommitRes.statusCode, 200);
+    const noopCommitBody = noopCommitRes.json() as CommitResponse;
+    assert.equal(noopCommitBody.appliedChanges, 0);
+    assert.equal(noopCommitBody.newCheckpoint, "cp_2");
+
+    const checkpointResult = await query<{ latest_checkpoint: string }>(
+      "SELECT latest_checkpoint FROM vault_sync_state WHERE vault_id = $1",
+      [context.vaultId]
+    );
+    assert.equal(Number(checkpointResult.rows[0]?.latest_checkpoint ?? 0), 2);
+  } finally {
+    await destroyTestContext(context);
+    await cleanupObjectHashes([originalHash, updateHash]);
+  }
+});
+
 test("sync commit should serialize concurrent commits on same vault", async () => {
   const contentHashA = `sha256:test-concurrent-a-${randomUUID()}`;
   const contentHashB = `sha256:test-concurrent-b-${randomUUID()}`;
