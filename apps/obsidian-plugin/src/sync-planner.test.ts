@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildLocalPlan, normalizeQueuedChanges, planLocalChanges } from "./sync-planner";
+import { buildLocalPlan, isConflictCopyPath, normalizeQueuedChanges, planLocalChanges } from "./sync-planner";
 import type { IndexedFileState, QueuedChange } from "./state-store";
 
 function makeSnapshot(path: string, contentHash: string) {
@@ -171,4 +171,9 @@ test("normalizeQueuedChanges keeps backward compatibility with old queue format"
     attempts: 0,
     ts: 77
   });
+});
+
+test("isConflictCopyPath detects generated conflict files", () => {
+  assert.equal(isConflictCopyPath("notes/a.conflict-macbook-2026-04-07T10-00-00-000Z.md"), true);
+  assert.equal(isConflictCopyPath("notes/a.md"), false);
 });

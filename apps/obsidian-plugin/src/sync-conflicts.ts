@@ -4,7 +4,11 @@ import type { IndexedFileState } from "./state-store";
 const CONFLICT_COPY_MARKER = ".conflict-";
 
 export function shouldCreateConflictCopy(changePath: string, conflict: SyncConflict): boolean {
-  if (conflict.code !== "VERSION_CONFLICT" && conflict.code !== "PATH_CONFLICT") {
+  if (
+    conflict.code !== "VERSION_CONFLICT" &&
+    conflict.code !== "PATH_CONFLICT" &&
+    conflict.code !== "FILE_NOT_FOUND"
+  ) {
     return false;
   }
 
@@ -53,4 +57,27 @@ export function pruneMissingFileIndexEntries(
   }
 
   return nextIndex;
+}
+
+export function collectLocalDeletionPaths(changes: SyncChangeRequest[], conflicts: SyncConflict[]): string[] {
+  const paths = new Set<string>();
+
+  for (const conflict of conflicts) {
+    const change = changes[conflict.index];
+    if (!change || change.op !== "delete") {
+      continue;
+    }
+
+    paths.add(change.path);
+  }
+
+  return Array.from(paths);
+}
+
+export function areAllConflictsLocalDeletes(changes: SyncChangeRequest[], conflicts: SyncConflict[]): boolean {
+  if (conflicts.length === 0) {
+    return false;
+  }
+
+  return conflicts.every((conflict) => changes[conflict.index]?.op === "delete");
 }

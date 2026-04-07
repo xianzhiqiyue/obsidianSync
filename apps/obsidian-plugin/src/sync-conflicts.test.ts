@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { SyncChangeRequest, SyncConflict } from "./api-client";
 import type { IndexedFileState } from "./state-store";
-import { pruneMissingFileIndexEntries, shouldCreateConflictCopy } from "./sync-conflicts";
+import {
+  areAllConflictsLocalDeletes,
+  collectLocalDeletionPaths,
+  pruneMissingFileIndexEntries,
+  shouldCreateConflictCopy
+} from "./sync-conflicts";
 
 test("shouldCreateConflictCopy only keeps real merge conflicts and avoids nested conflict copies", () => {
   const versionConflict: SyncConflict = {
@@ -19,11 +24,18 @@ test("shouldCreateConflictCopy only keeps real merge conflicts and avoids nested
   };
 
   assert.equal(shouldCreateConflictCopy("notes/a.md", versionConflict), true);
+  assert.equal(shouldCreateConflictCopy("notes/a.md", fileMissingConflict), true);
   assert.equal(
     shouldCreateConflictCopy("notes/a.conflict-ubuntu-device-2026-04-03T02-31-57-960Z.md", versionConflict),
     false
   );
-  assert.equal(shouldCreateConflictCopy("notes/a.md", fileMissingConflict), false);
+  assert.equal(
+    shouldCreateConflictCopy(
+      "notes/a.conflict-ubuntu-device-2026-04-03T02-31-57-960Z.md",
+      fileMissingConflict
+    ),
+    false
+  );
 });
 
 test("pruneMissingFileIndexEntries removes stale file ids reported by prepare conflicts", () => {
@@ -84,4 +96,107 @@ test("pruneMissingFileIndexEntries removes stale file ids reported by prepare co
 
   assert.deepEqual(Object.keys(nextIndex), ["notes/b.md"]);
   assert.equal(nextIndex["notes/b.md"]?.fileId, "33333333-3333-3333-3333-333333333333");
+});
+
+test("collectLocalDeletionPaths keeps local delete intent for conflicted files", () => {
+  const changes: SyncChangeRequest[] = [
+    {
+      op: "delete",
+      fileId: "11111111-1111-1111-1111-111111111111",
+      path: "notes/a.md",
+      baseVersion: 2
+    },
+    {
+      op: "update",
+      fileId: "22222222-2222-2222-2222-222222222222",
+      path: "notes/b.md",
+      baseVersion: 1,
+      contentHash: "sha256:new"
+    },
+    {
+      op: "delete",
+      fileId: "33333333-3333-3333-3333-333333333333",
+      path: "notes/c.md",
+      baseVersion: 4
+    }
+  ];
+  const conflicts: SyncConflict[] = [
+    {
+      index: 0,
+      code: "VERSION_CONFLICT",
+      fileId: "11111111-1111-1111-1111-111111111111",
+      path: "notes/a.md",
+      message: "version conflict"
+    },
+    {
+      index: 1,
+      code: "VERSION_CONFLICT",
+      fileId: "22222222-2222-2222-2222-222222222222",
+      path: "notes/b.md",
+      message: "version conflict"
+    },
+    {
+      index: 2,
+      code: "FILE_NOT_FOUND",
+      fileId: "33333333-3333-3333-3333-333333333333",
+      path: "notes/c.md",
+      message: "file missing"
+    }
+  ];
+
+  assert.deepEqual(collectLocalDeletionPaths(changes, conflicts), ["notes/a.md", "notes/c.md"]);
+});
+
+test("areAllConflictsLocalDeletes only returns true for pure delete conflicts", () => {
+  const deleteOnlyChanges: SyncChangeRequest[] = [
+    {
+      op: "delete",
+      fileId: "11111111-1111-1111-1111-111111111111",
+      path: "notes/a.md",
+      baseVersion: 2
+    },
+    {
+      op: "delete",
+      fileId: "22222222-2222-2222-2222-222222222222",
+      path: "notes/b.md",
+      baseVersion: 5
+    }
+  ];
+  const deleteOnlyConflicts: SyncConflict[] = [
+    {
+      index: 0,
+      code: "VERSION_CONFLICT",
+      path: "notes/a.md",
+      message: "version conflict"
+    },
+    {
+      index: 1,
+      code: "FILE_NOT_FOUND",
+      path: "notes/b.md",
+      message: "file missing"
+    }
+  ];
+  const mixedChanges: SyncChangeRequest[] = [
+    ...deleteOnlyChanges,
+    {
+      op: "update",
+      fileId: "33333333-3333-3333-3333-333333333333",
+      path: "notes/c.md",
+      baseVersion: 1,
+      contentHash: "sha256:new"
+    }
+  ];
+  const mixedConflicts: SyncConflict[] = [
+    ...deleteOnlyConflicts,
+    {
+      index: 2,
+      code: "VERSION_CONFLICT",
+      path: "notes/c.md",
+      message: "version conflict"
+    }
+  ];
+
+  assert.equal(areAllConflictsLocalDeletes(deleteOnlyChanges, deleteOnlyConflicts), true);
+  assert.equal(areAllConflictsLocalDeletes(mixedChanges, mixedConflicts), false);
+  assert.equal(areAllConflictsLocalDeletes(deleteOnlyChanges, []), false);
 });

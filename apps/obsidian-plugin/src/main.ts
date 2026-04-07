@@ -8,24 +8,20 @@ import {
   SyncApiError
 } from "./api-client";
 import {
-  openConflictResolutionModal,
-  type ConflictResolutionAction,
-  type ConflictResolutionCandidate
-} from "./conflict-resolution-modal";
-import {
   DEFAULT_LOCAL_SYNC_STATE,
   LocalStateStore,
   type IndexedFileState,
   type LocalSyncState,
   type PendingConflictSummary
 } from "./state-store";
-import { pruneMissingFileIndexEntries, shouldCreateConflictCopy } from "./sync-conflicts";
+import { openConflictAcknowledgeModal } from "./conflict-resolution-modal";
 import {
-  buildConflictResolutionCandidate,
-  buildConflictResolutionId,
-  createTextPreview
-} from "./sync-conflict-candidates";
-import { buildLocalPlan, normalizeQueuedChanges, type LocalFileSnapshot } from "./sync-planner";
+  areAllConflictsLocalDeletes,
+  collectLocalDeletionPaths,
+  pruneMissingFileIndexEntries,
+  shouldCreateConflictCopy
+} from "./sync-conflicts";
+import { buildLocalPlan, isConflictCopyPath, normalizeQueuedChanges, type LocalFileSnapshot } from "./sync-planner";
 import { shouldNotifyBlocked, shouldNotifyFailure } from "./sync-notify";
 import { runWithRetry } from "./sync-retry";
 
@@ -239,10 +235,10 @@ export default class CustomSyncPlugin extends Plugin {
     }
 
     const failure = this.stateStore.getFailureState();
-    if (failure.blocked) {
+    if (failure.blocked && !this.isInteractiveTrigger(reason)) {
       this.lastSyncResult = "blocked";
       this.lastSyncError = failure.lastError ?? "同步已阻塞";
-      const blockedMessage = `由于上次不可重试错误，当前同步已阻塞：${failure.lastError ?? "未知错误"}。请排查后手动清除失败状态。`;
+      const blockedMessage = `由于上次不可重试错误，当前自动同步已暂停：${failure.lastError ?? "未知错误"}。修复后请手动执行一次同步。`;
       if (this.shouldNotifyBlocked(reason)) {
         new Notice(blockedMessage);
       }
@@ -253,6 +249,11 @@ export default class CustomSyncPlugin extends Plugin {
     if (pendingConflicts.items.length > 0 && !this.isInteractiveTrigger(reason)) {
       this.lastSyncResult = "skipped";
       this.lastSyncError = `存在 ${pendingConflicts.items.length} 个待处理冲突`;
+      return;
+    }
+    if (this.hasLocalConflictCopies() && !this.isInteractiveTrigger(reason)) {
+      this.lastSyncResult = "skipped";
+      this.lastSyncError = "存在本地冲突副本，已跳过自动同步";
       return;
     }
 
@@ -309,8 +310,8 @@ export default class CustomSyncPlugin extends Plugin {
   }
 
   private async runSyncOnceInternal(signal: AbortSignal, resolutionDepth = 0): Promise<void> {
-    if (resolutionDepth > 2) {
-      throw new Error("冲突处理重试次数过多，请稍后重试。");
+    if (resolutionDepth > 1) {
+      throw new Error("冲突自动重试次数过多，请稍后手动重试。");
     }
     this.throwIfAborted(signal);
     const client = this.getApiClient();
@@ -334,19 +335,22 @@ export default class CustomSyncPlugin extends Plugin {
       this.throwIfAborted(signal);
       const prepare = await client.prepare(token, this.settings.vaultId, initialCheckpoint, localPlan.changes, signal);
       if (prepare.conflicts.length > 0) {
-        const resolution = await this.resolvePrepareConflicts(
+        const resolution = await this.handlePrepareConflicts(
           client,
           token,
           currentIndex,
           localPlan,
           prepare.conflicts,
+          this.isInteractiveTrigger(this.lastSyncReason),
           signal
         );
         if (resolution === "retry") {
           await this.runSyncOnceInternal(signal, resolutionDepth + 1);
           return;
         }
-        throw new SyncConflictResolutionRequiredError(`存在 ${prepare.conflicts.length} 个冲突待处理。`);
+        throw new SyncConflictResolutionRequiredError(
+          `发现 ${prepare.conflicts.length} 个冲突，已保留本地冲突副本并回放远端最新状态。请先在本地合并后再次同步。`
+        );
       }
 
       await this.uploadTargetsWithConcurrency(client, prepare.uploadTargets, localPlan.hashToSnapshot, signal);
@@ -488,6 +492,9 @@ export default class CustomSyncPlugin extends Plugin {
     for (const file of this.app.vault.getFiles()) {
       this.throwIfAborted(signal);
       if (file.path.startsWith(".obsidian/")) {
+        continue;
+      }
+      if (isConflictCopyPath(file.path)) {
         continue;
       }
       const bytes = await this.app.vault.readBinary(file);
@@ -672,10 +679,32 @@ export default class CustomSyncPlugin extends Plugin {
   }
 
   private async handlePrepareConflicts(
+    client: SyncApiClient,
+    accessToken: string,
+    currentIndex: Record<string, IndexedFileState>,
     localPlan: { changes: SyncChangeRequest[]; hashToSnapshot: Record<string, LocalFileSnapshot> },
     conflicts: SyncConflict[],
+    interactive: boolean,
     signal: AbortSignal
-  ): Promise<void> {
+  ): Promise<"retry" | "pending"> {
+    const repairedIndex = pruneMissingFileIndexEntries(currentIndex, localPlan.changes, conflicts);
+    const localDeletionPaths = collectLocalDeletionPaths(localPlan.changes, conflicts);
+    const pureDeleteConflicts = areAllConflictsLocalDeletes(localPlan.changes, conflicts);
+    if (repairedIndex !== currentIndex) {
+      await this.stateStore.replaceFileIndexByPath(repairedIndex);
+    }
+
+    const pendingSummaries = conflicts.map<PendingConflictSummary>((conflict) => {
+      const change = localPlan.changes[conflict.index];
+      return {
+        id: this.buildPendingConflictId(conflict, change?.path ?? conflict.path),
+        code: conflict.code,
+        path: change?.path ?? conflict.path,
+        fileId: conflict.fileId,
+        message: conflict.message
+      };
+    });
+
     let copiedCount = 0;
     for (const conflict of conflicts) {
       this.throwIfAborted(signal);
@@ -710,118 +739,34 @@ export default class CustomSyncPlugin extends Plugin {
     }
 
     if (copiedCount > 0) {
-      new Notice(`已生成 ${copiedCount} 个冲突副本文件。`);
+      new Notice(`已生成 ${copiedCount} 个冲突副本文件，当前已回到远端最新状态。`);
     }
-  }
-
-  private async resolvePrepareConflicts(
-    client: SyncApiClient,
-    accessToken: string,
-    currentIndex: Record<string, IndexedFileState>,
-    localPlan: { changes: SyncChangeRequest[]; hashToSnapshot: Record<string, LocalFileSnapshot> },
-    conflicts: SyncConflict[],
-    signal: AbortSignal
-  ): Promise<"retry" | "deferred"> {
-    const repairedIndex = pruneMissingFileIndexEntries(currentIndex, localPlan.changes, conflicts);
-    if (repairedIndex !== currentIndex) {
-      await this.stateStore.replaceFileIndexByPath(repairedIndex);
+    if (interactive && this.hasRemoteDeletedConflicts(conflicts) && !signal.aborted) {
+      await openConflictAcknowledgeModal(this.app, conflicts.filter((item) => item.remoteDeleted));
     }
-
-    const candidates = this.buildConflictResolutionCandidates(localPlan, conflicts);
-    const modalResult = await openConflictResolutionModal(this.app, candidates);
-    const pendingSummaries = candidates.map<PendingConflictSummary>((item) => ({
-      id: item.id,
-      code: item.code,
-      path: item.path,
-      fileId: item.fileId,
-      message: item.message
-    }));
-
-    if (modalResult.action === "defer" || Object.values(modalResult.selections).some((value) => value === "defer")) {
-      await this.stateStore.setPendingConflicts(pendingSummaries);
-      return "deferred";
-    }
-
-    await this.stateStore.clearPendingConflicts();
-    const localRestores = await this.collectLocalRestores(localPlan, conflicts, candidates, modalResult.selections, signal);
+    await this.stateStore.setPendingConflicts(pendingSummaries);
     await this.rebaseToRemoteState(client, accessToken, signal);
-
-    for (const restore of localRestores) {
-      await this.writeLocalFile(restore.path, restore.bytes, signal);
+    for (const path of localDeletionPaths) {
+      await this.deleteLocalFileIfExists(path, signal);
     }
-
-    return "retry";
-  }
-
-  private buildConflictResolutionCandidates(
-    localPlan: { changes: SyncChangeRequest[]; hashToSnapshot: Record<string, LocalFileSnapshot> },
-    conflicts: SyncConflict[]
-  ): ConflictResolutionCandidate[] {
-    return conflicts.map((conflict) => {
-      const change = localPlan.changes[conflict.index];
-      const path = change?.path ?? conflict.path;
-      const localFile = this.app.vault.getAbstractFileByPath(path);
-      const previewBytes =
-        (change?.contentHash ? localPlan.hashToSnapshot[change.contentHash]?.bytes : undefined) ?? null;
-      return buildConflictResolutionCandidate(conflict, localPlan, {
-        exists: localFile instanceof TFile,
-        isConflictCopy: path.includes(".conflict-"),
-        previewText: previewBytes ? createTextPreview(previewBytes) : null
-      });
-    });
-  }
-
-  private getConflictResolutionId(conflict: SyncConflict, path: string): string {
-    return buildConflictResolutionId(conflict, path);
-  }
-
-  private async collectLocalRestores(
-    localPlan: { changes: SyncChangeRequest[]; hashToSnapshot: Record<string, LocalFileSnapshot> },
-    conflicts: SyncConflict[],
-    candidates: ConflictResolutionCandidate[],
-    selections: Record<string, ConflictResolutionAction>,
-    signal: AbortSignal
-  ): Promise<Array<{ path: string; bytes: ArrayBuffer }>> {
-    const candidateById = new Map(candidates.map((item) => [item.id, item]));
-    const restores: Array<{ path: string; bytes: ArrayBuffer }> = [];
-
-    for (const conflict of conflicts) {
-      const change = localPlan.changes[conflict.index];
-      if (!change) {
-        continue;
-      }
-
-      const resolutionId = this.getConflictResolutionId(conflict, change.path);
-      if (selections[resolutionId] !== "use_local") {
-        continue;
-      }
-
-      const candidate = candidateById.get(resolutionId);
-      if (candidate?.localIsConflictCopy && conflict.code === "FILE_NOT_FOUND") {
-        continue;
-      }
-
-      let bytes: ArrayBuffer | null = null;
-      if (change.contentHash) {
-        bytes = localPlan.hashToSnapshot[change.contentHash]?.bytes ?? null;
-      }
-
-      if (!bytes) {
-        const existing = this.app.vault.getAbstractFileByPath(change.path);
-        if (existing instanceof TFile) {
-          bytes = await this.app.vault.readBinary(existing);
-        }
-      }
-
-      if (!bytes) {
-        continue;
-      }
-
-      restores.push({ path: change.path, bytes });
-      this.throwIfAborted(signal);
+    if (pureDeleteConflicts) {
+      await this.stateStore.clearPendingConflicts();
+      new Notice("检测到纯删除冲突，已自动按本地删除意图重新提交。");
+      return "retry";
     }
+    return "pending";
+  }
 
-    return restores;
+  private buildPendingConflictId(conflict: SyncConflict, path: string): string {
+    return [conflict.code, conflict.fileId ?? "-", path].join(":");
+  }
+
+  private hasLocalConflictCopies(): boolean {
+    return this.app.vault.getFiles().some((file) => isConflictCopyPath(file.path));
+  }
+
+  private hasRemoteDeletedConflicts(conflicts: SyncConflict[]): boolean {
+    return conflicts.some((conflict) => conflict.remoteDeleted);
   }
 
   private async rebaseToRemoteState(
@@ -1127,6 +1072,7 @@ export default class CustomSyncPlugin extends Plugin {
     const snapshot = this.stateStore.getSnapshot();
     const failure = snapshot.failure;
     return [
+      `API=${this.settings.apiBaseUrl || "-"} Vault=${this.settings.vaultId || "-"}`,
       `运行中=${this.syncInProgress ? "是" : "否"} 待执行=${this.pendingSync ? "是" : "否"}`,
       `最近触发=${this.formatSyncReason(this.lastSyncReason)} 结果=${this.formatSyncResult(this.lastSyncResult)}`,
       `最近开始=${this.formatTime(this.lastSyncStartedAtMs)} 最近结束=${this.formatTime(this.lastSyncFinishedAtMs)}`,

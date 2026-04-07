@@ -1,4 +1,5 @@
 import { App, Modal, Setting } from "obsidian";
+import type { SyncConflict } from "./api-client";
 
 export type ConflictResolutionAction = "use_local" | "use_remote" | "defer";
 
@@ -150,6 +151,55 @@ export function openConflictResolutionModal(
 ): Promise<ConflictResolutionModalResult> {
   return new Promise((resolve) => {
     const modal = new ConflictResolutionModal(app, conflicts, resolve);
+    modal.open();
+  });
+}
+
+class ConflictAcknowledgeModal extends Modal {
+  constructor(
+    app: App,
+    private readonly conflicts: SyncConflict[],
+    private readonly done: () => void
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl, titleEl } = this;
+    titleEl.setText("同步冲突待处理");
+    contentEl.empty();
+    contentEl.createEl("p", {
+      text: `发现 ${this.conflicts.length} 个冲突。已在本地生成冲突副本，并已回放服务器最新状态。请先在本地完成处理，再重新同步。`
+    });
+
+    for (const conflict of this.conflicts) {
+      const section = contentEl.createDiv({ cls: "custom-sync-conflict-item" });
+      section.createEl("h4", { text: `${conflict.code} · ${conflict.path}` });
+      section.createEl("pre", {
+        text: [
+          `文件 ID：${conflict.fileId ?? "-"}`,
+          `原因：${conflict.message}`,
+          `远端已删除：${conflict.remoteDeleted ? "是" : "否"}`
+        ].join("\n")
+      });
+    }
+
+    new Setting(contentEl).addButton((button) =>
+      button.setCta().setButtonText("我知道了").onClick(() => {
+        this.close();
+      })
+    );
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    this.done();
+  }
+}
+
+export function openConflictAcknowledgeModal(app: App, conflicts: SyncConflict[]): Promise<void> {
+  return new Promise((resolve) => {
+    const modal = new ConflictAcknowledgeModal(app, conflicts, resolve);
     modal.open();
   });
 }

@@ -1,6 +1,8 @@
 import type { SyncChangeRequest } from "./api-client";
 import type { IndexedFileState, QueuedChange } from "./state-store";
 
+const CONFLICT_COPY_MARKER = ".conflict-";
+
 export interface LocalFileSnapshot {
   path: string;
   contentHash: string;
@@ -44,6 +46,10 @@ export function buildLocalPlan(
   }
 
   return planLocalChanges(localSnapshots, fileIndexByPath, options);
+}
+
+export function isConflictCopyPath(path: string): boolean {
+  return path.includes(CONFLICT_COPY_MARKER);
 }
 
 export function planReplayChanges(
