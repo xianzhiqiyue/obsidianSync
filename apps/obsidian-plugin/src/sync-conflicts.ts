@@ -1,20 +1,6 @@
 import type { SyncChangeRequest, SyncConflict } from "./api-client";
 import type { IndexedFileState } from "./state-store";
 
-const CONFLICT_COPY_MARKER = ".conflict-";
-
-export function shouldCreateConflictCopy(changePath: string, conflict: SyncConflict): boolean {
-  if (
-    conflict.code !== "VERSION_CONFLICT" &&
-    conflict.code !== "PATH_CONFLICT" &&
-    conflict.code !== "FILE_NOT_FOUND"
-  ) {
-    return false;
-  }
-
-  return !changePath.includes(CONFLICT_COPY_MARKER);
-}
-
 export function pruneMissingFileIndexEntries(
   fileIndexByPath: Record<string, IndexedFileState>,
   changes: SyncChangeRequest[],

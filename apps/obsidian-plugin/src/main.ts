@@ -14,14 +14,23 @@ import {
   type LocalSyncState,
   type PendingConflictSummary
 } from "./state-store";
-import { openConflictAcknowledgeModal } from "./conflict-resolution-modal";
+import {
+  openConflictAcknowledgeModal,
+  openConflictResolutionModal,
+  type ConflictResolutionCandidate
+} from "./conflict-resolution-modal";
 import {
   areAllConflictsLocalDeletes,
   collectLocalDeletionPaths,
-  pruneMissingFileIndexEntries,
-  shouldCreateConflictCopy
+  pruneMissingFileIndexEntries
 } from "./sync-conflicts";
 import { buildLocalPlan, isConflictCopyPath, normalizeQueuedChanges, type LocalFileSnapshot } from "./sync-planner";
+import {
+  buildRemoteSummary,
+  createTextPreview,
+  getConflictRecommendationReason,
+  getRecommendedConflictAction
+} from "./sync-conflict-candidates";
 import { shouldNotifyBlocked, shouldNotifyFailure } from "./sync-notify";
 import { runWithRetry } from "./sync-retry";
 
@@ -140,6 +149,11 @@ export default class CustomSyncPlugin extends Plugin {
       name: "清除待决冲突",
       callback: () => void this.clearPendingConflicts()
     });
+    this.addCommand({
+      id: "custom-sync-clean-legacy-conflict-files",
+      name: "清理历史冲突文件",
+      callback: () => void this.cleanLegacyConflictFiles()
+    });
 
     this.setupTimer();
     this.setupForegroundResumeHooks();
@@ -224,6 +238,20 @@ export default class CustomSyncPlugin extends Plugin {
     new Notice("已清除待决冲突。");
   }
 
+  async cleanLegacyConflictFiles(): Promise<void> {
+    const legacyFiles = this.app.vault.getFiles().filter((file) => isConflictCopyPath(file.path));
+    if (legacyFiles.length === 0) {
+      new Notice("当前没有历史冲突文件。");
+      return;
+    }
+
+    for (const file of legacyFiles) {
+      await this.app.vault.delete(file, true);
+    }
+
+    new Notice(`已清理 ${legacyFiles.length} 个历史冲突文件。`);
+  }
+
   private async runSyncWithRetry(reason: string): Promise<void> {
     if (!this.settings.vaultId) {
       this.lastSyncResult = "skipped";
@@ -251,10 +279,13 @@ export default class CustomSyncPlugin extends Plugin {
       this.lastSyncError = `存在 ${pendingConflicts.items.length} 个待处理冲突`;
       return;
     }
-    if (this.hasLocalConflictCopies() && !this.isInteractiveTrigger(reason)) {
-      this.lastSyncResult = "skipped";
-      this.lastSyncError = "存在本地冲突副本，已跳过自动同步";
-      return;
+    if (pendingConflicts.items.length > 0 && this.isInteractiveTrigger(reason)) {
+      const pendingResolution = await this.resolvePendingConflictsInteractively();
+      if (pendingResolution === "defer") {
+        this.lastSyncResult = "skipped";
+        this.lastSyncError = `存在 ${pendingConflicts.items.length} 个待处理冲突`;
+        return;
+      }
     }
 
     const result = await runWithRetry({
@@ -349,7 +380,7 @@ export default class CustomSyncPlugin extends Plugin {
           return;
         }
         throw new SyncConflictResolutionRequiredError(
-          `发现 ${prepare.conflicts.length} 个冲突，已保留本地冲突副本并回放远端最新状态。请先在本地合并后再次同步。`
+          `发现 ${prepare.conflicts.length} 个冲突，已保存本地待解决内容并回放远端最新状态。请先处理待决冲突，再重新同步。`
         );
       }
 
@@ -694,53 +725,8 @@ export default class CustomSyncPlugin extends Plugin {
       await this.stateStore.replaceFileIndexByPath(repairedIndex);
     }
 
-    const pendingSummaries = conflicts.map<PendingConflictSummary>((conflict) => {
-      const change = localPlan.changes[conflict.index];
-      return {
-        id: this.buildPendingConflictId(conflict, change?.path ?? conflict.path),
-        code: conflict.code,
-        path: change?.path ?? conflict.path,
-        fileId: conflict.fileId,
-        message: conflict.message
-      };
-    });
-
-    let copiedCount = 0;
-    for (const conflict of conflicts) {
-      this.throwIfAborted(signal);
-      const change = localPlan.changes[conflict.index];
-      if (!change) {
-        continue;
-      }
-      if (!shouldCreateConflictCopy(change.path, conflict)) {
-        continue;
-      }
-
-      let bytes: ArrayBuffer | null = null;
-      if (change.contentHash) {
-        const snapshot = localPlan.hashToSnapshot[change.contentHash];
-        bytes = snapshot?.bytes ?? null;
-      }
-
-      if (!bytes) {
-        const existing = this.app.vault.getAbstractFileByPath(change.path);
-        if (existing instanceof TFile) {
-          bytes = await this.app.vault.readBinary(existing);
-        }
-      }
-
-      if (!bytes) {
-        continue;
-      }
-
-      const conflictPath = this.createConflictCopyPath(change.path);
-      await this.writeLocalFile(conflictPath, bytes, signal);
-      copiedCount += 1;
-    }
-
-    if (copiedCount > 0) {
-      new Notice(`已生成 ${copiedCount} 个冲突副本文件，当前已回到远端最新状态。`);
-    }
+    const pendingSummaries = await this.buildPendingConflictSummaries(localPlan, conflicts, signal);
+    new Notice(`已保存 ${pendingSummaries.length} 个待处理冲突，当前已回到远端最新状态。`);
     if (interactive && this.hasRemoteDeletedConflicts(conflicts) && !signal.aborted) {
       await openConflictAcknowledgeModal(this.app, conflicts.filter((item) => item.remoteDeleted));
     }
@@ -761,8 +747,89 @@ export default class CustomSyncPlugin extends Plugin {
     return [conflict.code, conflict.fileId ?? "-", path].join(":");
   }
 
-  private hasLocalConflictCopies(): boolean {
-    return this.app.vault.getFiles().some((file) => isConflictCopyPath(file.path));
+  private async buildPendingConflictSummaries(
+    localPlan: { changes: SyncChangeRequest[]; hashToSnapshot: Record<string, LocalFileSnapshot> },
+    conflicts: SyncConflict[],
+    signal: AbortSignal
+  ): Promise<PendingConflictSummary[]> {
+    const items: PendingConflictSummary[] = [];
+    for (const conflict of conflicts) {
+      this.throwIfAborted(signal);
+      const change = localPlan.changes[conflict.index];
+      const path = change?.path ?? conflict.path;
+      const bytes = await this.readConflictBytes(path, change?.contentHash, localPlan.hashToSnapshot);
+      const recommendedAction = getRecommendedConflictAction(conflict, path);
+      items.push({
+        id: this.buildPendingConflictId(conflict, path),
+        code: conflict.code,
+        path,
+        fileId: conflict.fileId,
+        message: conflict.message,
+        localPreview: bytes ? createTextPreview(bytes) : null,
+        localContentBase64: bytes ? this.arrayBufferToBase64(bytes) : null,
+        remoteSummary: buildRemoteSummary(conflict),
+        recommendedAction,
+        recommendedReason: getConflictRecommendationReason(recommendedAction, conflict, path),
+        remoteDeleted: Boolean(conflict.remoteDeleted)
+      });
+    }
+    return items;
+  }
+
+  private async readConflictBytes(
+    path: string,
+    contentHash: string | undefined,
+    hashToSnapshot: Record<string, LocalFileSnapshot>
+  ): Promise<ArrayBuffer | null> {
+    if (contentHash) {
+      const snapshot = hashToSnapshot[contentHash];
+      if (snapshot?.bytes) {
+        return snapshot.bytes;
+      }
+    }
+
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof TFile) {
+      return this.app.vault.readBinary(existing);
+    }
+
+    return null;
+  }
+
+  private async resolvePendingConflictsInteractively(): Promise<"retry" | "defer"> {
+    const pending = this.stateStore.getPendingConflicts();
+    const candidates: ConflictResolutionCandidate[] = pending.items.map((item) => ({
+      id: item.id,
+      code: item.code,
+      path: item.path,
+      fileId: item.fileId,
+      message: item.message,
+      localExists: item.localContentBase64 !== null,
+      localIsConflictCopy: false,
+      localPreview: item.localPreview,
+      remoteSummary: item.remoteSummary,
+      recommendedAction: item.recommendedAction,
+      recommendedReason: item.recommendedReason
+    }));
+    const modalResult = await openConflictResolutionModal(this.app, candidates);
+    if (modalResult.action === "defer" || Object.values(modalResult.selections).some((value) => value === "defer")) {
+      await this.stateStore.setPendingConflicts(pending.items);
+      return "defer";
+    }
+
+    const signal = new AbortController().signal;
+    for (const item of pending.items) {
+      if (modalResult.selections[item.id] !== "use_local") {
+        continue;
+      }
+      if (!item.localContentBase64) {
+        continue;
+      }
+      await this.writeLocalFile(item.path, this.base64ToArrayBuffer(item.localContentBase64), signal);
+    }
+
+    await this.stateStore.clearPendingConflicts();
+    return "retry";
   }
 
   private hasRemoteDeletedConflicts(conflicts: SyncConflict[]): boolean {
@@ -892,15 +959,22 @@ export default class CustomSyncPlugin extends Plugin {
     return `sha256:${hex}`;
   }
 
-  private createConflictCopyPath(originalPath: string): string {
-    const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    const lastDot = originalPath.lastIndexOf(".");
-    if (lastDot <= 0 || originalPath.slice(lastDot).includes("/")) {
-      return `${originalPath}.conflict-${this.settings.deviceName}-${ts}`;
+  private arrayBufferToBase64(bytes: ArrayBuffer): string {
+    let binary = "";
+    const view = new Uint8Array(bytes);
+    for (const byte of view) {
+      binary += String.fromCharCode(byte);
     }
-    const base = originalPath.slice(0, lastDot);
-    const ext = originalPath.slice(lastDot);
-    return `${base}.conflict-${this.settings.deviceName}-${ts}${ext}`;
+    return btoa(binary);
+  }
+
+  private base64ToArrayBuffer(value: string): ArrayBuffer {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes.buffer;
   }
 
   private isRetryableError(error: unknown): boolean {
@@ -1288,6 +1362,13 @@ class SyncSettingTab extends PluginSettingTab {
           refreshStatus();
           refreshPendingConflicts();
         })
+      )
+      .addButton((button) =>
+        button.setButtonText("清理历史冲突文件").onClick(async () => {
+          await this.plugin.cleanLegacyConflictFiles();
+          refreshStatus();
+          refreshPendingConflicts();
+        })
       );
 
     new Setting(containerEl)
@@ -1311,6 +1392,11 @@ class SyncSettingTab extends PluginSettingTab {
       .addButton((button) =>
         button.setButtonText("清除待决冲突").onClick(async () => {
           await this.plugin.clearPendingConflicts();
+        })
+      )
+      .addButton((button) =>
+        button.setButtonText("清理历史冲突文件").onClick(async () => {
+          await this.plugin.cleanLegacyConflictFiles();
         })
       )
       .addButton((button) =>

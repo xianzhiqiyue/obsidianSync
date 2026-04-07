@@ -57,7 +57,13 @@ test("pending conflict state can be stored and cleared", async () => {
       code: "FILE_NOT_FOUND",
       path: "notes/a.md",
       fileId: "11111111-1111-1111-1111-111111111111",
-      message: "file not found or deleted"
+      message: "file not found or deleted",
+      localPreview: "local text",
+      localContentBase64: "bG9jYWwgdGV4dA==",
+      remoteSummary: "remote deleted",
+      recommendedAction: "use_local",
+      recommendedReason: "keep local",
+      remoteDeleted: true
     }
   ];
 
@@ -65,6 +71,7 @@ test("pending conflict state can be stored and cleared", async () => {
   const pending = store.getPendingConflicts();
   assert.equal(pending.items.length, 1);
   assert.equal(pending.items[0]?.id, "c1");
+  assert.equal(pending.items[0]?.localPreview, "local text");
   assert.equal(pending.deferredAt, 123);
 
   await store.clearPendingConflicts();

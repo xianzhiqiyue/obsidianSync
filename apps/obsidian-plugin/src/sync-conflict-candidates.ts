@@ -28,7 +28,7 @@ export function getConflictRecommendationReason(
 ): string {
   if (action === "use_remote") {
     if (path.includes(".conflict-")) {
-      return "当前文件已经是冲突副本，继续保留本地通常只会制造更多套娃副本。";
+      return "当前文件看起来是历史冲突遗留文件，继续保留本地通常只会留下更多无效垃圾。";
     }
     return "优先接受远端状态，避免继续放大当前冲突。";
   }

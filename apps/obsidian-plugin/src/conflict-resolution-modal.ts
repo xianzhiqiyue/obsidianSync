@@ -52,7 +52,6 @@ export class ConflictResolutionModal extends Modal {
 
       const details = [
         `本地存在：${conflict.localExists ? "是" : "否"}`,
-        `本地为冲突副本：${conflict.localIsConflictCopy ? "是" : "否"}`,
         `文件 ID：${conflict.fileId ?? "-"}`,
         `原因：${conflict.message}`
       ].join("\n");
@@ -136,7 +135,7 @@ export class ConflictResolutionModal extends Modal {
 
   private describeAction(action: ConflictResolutionAction, reason: string): string {
     if (action === "use_local") {
-      return `保留当前本地文件内容，后续将以本地版本重新提交。建议原因：${reason}`;
+      return `恢复本地待解决内容到原路径，后续将以本地版本重新提交。建议原因：${reason}`;
     }
     if (action === "use_remote") {
       return `接受远端当前状态，本地会回到远端结果。建议原因：${reason}`;
@@ -169,7 +168,7 @@ class ConflictAcknowledgeModal extends Modal {
     titleEl.setText("同步冲突待处理");
     contentEl.empty();
     contentEl.createEl("p", {
-      text: `发现 ${this.conflicts.length} 个冲突。已在本地生成冲突副本，并已回放服务器最新状态。请先在本地完成处理，再重新同步。`
+      text: `发现 ${this.conflicts.length} 个冲突。已保存本地待解决内容，并已回放服务器最新状态。请先处理这些冲突，再重新同步。`
     });
 
     for (const conflict of this.conflicts) {

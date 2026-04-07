@@ -30,6 +30,12 @@ export interface PendingConflictSummary {
   path: string;
   fileId?: string;
   message: string;
+  localPreview: string | null;
+  localContentBase64: string | null;
+  remoteSummary: string | null;
+  recommendedAction: "use_local" | "use_remote" | "defer";
+  recommendedReason: string;
+  remoteDeleted: boolean;
 }
 
 export interface PendingConflictState {
@@ -43,6 +49,22 @@ export interface LocalSyncState {
   fileIndexByPath: Record<string, IndexedFileState>;
   failure: SyncFailureState;
   pendingConflicts: PendingConflictState;
+}
+
+function normalizePendingConflictItems(items: PendingConflictSummary[]): PendingConflictSummary[] {
+  return items.map((item) => ({
+    id: item.id,
+    code: item.code,
+    path: item.path,
+    fileId: item.fileId,
+    message: item.message,
+    localPreview: item.localPreview ?? null,
+    localContentBase64: item.localContentBase64 ?? null,
+    remoteSummary: item.remoteSummary ?? null,
+    recommendedAction: item.recommendedAction ?? "defer",
+    recommendedReason: item.recommendedReason ?? "当前信息不足，建议先人工确认后再决定。",
+    remoteDeleted: item.remoteDeleted ?? false
+  }));
 }
 
 const DEFAULT_FAILURE_STATE: SyncFailureState = {
@@ -87,7 +109,7 @@ export class LocalStateStore {
         lastFailedAt: initialState.failure.lastFailedAt
       },
       pendingConflicts: {
-        items: pendingConflicts.items.map((item) => ({ ...item })),
+        items: normalizePendingConflictItems(pendingConflicts.items),
         deferredAt: pendingConflicts.deferredAt
       }
     };
@@ -107,7 +129,7 @@ export class LocalStateStore {
         lastFailedAt: this.state.failure.lastFailedAt
       },
       pendingConflicts: {
-        items: this.state.pendingConflicts.items.map((item) => ({ ...item })),
+        items: normalizePendingConflictItems(this.state.pendingConflicts.items),
         deferredAt: this.state.pendingConflicts.deferredAt
       }
     };
@@ -180,14 +202,14 @@ export class LocalStateStore {
 
   getPendingConflicts(): PendingConflictState {
     return {
-      items: this.state.pendingConflicts.items.map((item) => ({ ...item })),
+      items: normalizePendingConflictItems(this.state.pendingConflicts.items),
       deferredAt: this.state.pendingConflicts.deferredAt
     };
   }
 
   async setPendingConflicts(items: PendingConflictSummary[], deferredAt = Date.now()): Promise<void> {
     this.state.pendingConflicts = {
-      items: items.map((item) => ({ ...item })),
+      items: normalizePendingConflictItems(items),
       deferredAt
     };
     await this.flush();

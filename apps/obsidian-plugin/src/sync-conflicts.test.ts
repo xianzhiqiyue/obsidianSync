@@ -5,38 +5,8 @@ import type { IndexedFileState } from "./state-store";
 import {
   areAllConflictsLocalDeletes,
   collectLocalDeletionPaths,
-  pruneMissingFileIndexEntries,
-  shouldCreateConflictCopy
+  pruneMissingFileIndexEntries
 } from "./sync-conflicts";
-
-test("shouldCreateConflictCopy only keeps real merge conflicts and avoids nested conflict copies", () => {
-  const versionConflict: SyncConflict = {
-    index: 0,
-    code: "VERSION_CONFLICT",
-    path: "notes/a.md",
-    message: "version mismatch"
-  };
-  const fileMissingConflict: SyncConflict = {
-    index: 0,
-    code: "FILE_NOT_FOUND",
-    path: "notes/a.md",
-    message: "file missing"
-  };
-
-  assert.equal(shouldCreateConflictCopy("notes/a.md", versionConflict), true);
-  assert.equal(shouldCreateConflictCopy("notes/a.md", fileMissingConflict), true);
-  assert.equal(
-    shouldCreateConflictCopy("notes/a.conflict-ubuntu-device-2026-04-03T02-31-57-960Z.md", versionConflict),
-    false
-  );
-  assert.equal(
-    shouldCreateConflictCopy(
-      "notes/a.conflict-ubuntu-device-2026-04-03T02-31-57-960Z.md",
-      fileMissingConflict
-    ),
-    false
-  );
-});
 
 test("pruneMissingFileIndexEntries removes stale file ids reported by prepare conflicts", () => {
   const fileIndexByPath: Record<string, IndexedFileState> = {
