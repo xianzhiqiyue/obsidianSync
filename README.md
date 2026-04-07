@@ -67,6 +67,14 @@ cp infra/.env.prod.example infra/.env.prod
 docker compose --env-file infra/.env.prod -f infra/docker-compose.yml -f infra/docker-compose.prod.yml up -d
 ```
 
+当前阿里云单机环境若采用 `/home/admin/obsidianSync` + `nohup node dist/index.js` 方式运行 `sync-api`，可直接使用：
+
+```bash
+python3 scripts/deploy-sync-api-aliyun.py
+```
+
+该脚本会同步 `sync-api` 和 `packages/shared` 的最小运行集、远端重建并重启 `sync-api`，最后执行 `health/ready` 检查。
+
 `.env.prod` 推荐最小暴露策略：
 - `POSTGRES_PORT_BIND=127.0.0.1:5432:5432`
 - `MINIO_API_PORT_BIND=0.0.0.0:9000:9000`
