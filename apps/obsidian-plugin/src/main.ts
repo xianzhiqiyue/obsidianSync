@@ -24,6 +24,7 @@ import {
   collectLocalDeletionPaths,
   pruneMissingFileIndexEntries
 } from "./sync-conflicts";
+import { applyRemoteChangesToIndex } from "./sync-remote-index";
 import { buildLocalPlan, isConflictCopyPath, normalizeQueuedChanges, type LocalFileSnapshot } from "./sync-planner";
 import {
   buildRemoteSummary,
@@ -347,11 +348,31 @@ export default class CustomSyncPlugin extends Plugin {
     this.throwIfAborted(signal);
     const client = this.getApiClient();
     const token = await this.ensureAccessToken(signal);
-    const initialCheckpoint = this.checkpointToNumber(this.stateStore.getCheckpoint());
+    const localCheckpoint = this.stateStore.getCheckpoint();
+    let initialCheckpoint = this.checkpointToNumber(localCheckpoint);
     let pullFromCheckpoint = initialCheckpoint;
+    let currentIndex = this.stateStore.getFileIndexByPath();
+    let failedQueue = this.stateStore.getFailureState().failedQueue;
+    const initialState = await client.getSyncState(token, this.settings.vaultId, signal);
+    const initialServerCheckpoint = this.checkpointToNumber(initialState.checkpoint);
+    if (initialServerCheckpoint < initialCheckpoint) {
+      const rebuilt = await this.rebuildRemoteBaseline(client, token, initialServerCheckpoint, signal);
+      initialCheckpoint = rebuilt.checkpoint;
+      pullFromCheckpoint = rebuilt.checkpoint;
+      currentIndex = rebuilt.index;
+      failedQueue = [];
+      if (this.settings.enableDebugPanel) {
+        console.warn("[custom-sync] server checkpoint rolled back", {
+          localCheckpoint: localCheckpoint ?? "cp_0",
+          serverCheckpoint: initialState.checkpoint,
+          rebuiltCheckpoint: `cp_${rebuilt.checkpoint}`
+        });
+      }
+      if (this.isInteractiveTrigger(this.lastSyncReason)) {
+        new Notice("检测到服务端检查点回退，已重建同步索引并重新计算本地变更。");
+      }
+    }
 
-    const currentIndex = this.stateStore.getFileIndexByPath();
-    const failedQueue = this.stateStore.getFailureState().failedQueue;
     const localSnapshots = await this.collectLocalSnapshots(signal);
     const localPlan = buildLocalPlan(failedQueue, localSnapshots, currentIndex);
     await this.stateStore.replaceQueue(localPlan.queuePreview);
@@ -537,6 +558,55 @@ export default class CustomSyncPlugin extends Plugin {
       };
     }
     return result;
+  }
+
+  private async rebuildRemoteBaseline(
+    client: SyncApiClient,
+    accessToken: string,
+    serverCheckpoint: number,
+    signal: AbortSignal
+  ): Promise<{ checkpoint: number; index: Record<string, IndexedFileState> }> {
+    const rebuilt = await this.fetchRemoteIndexState(client, accessToken, serverCheckpoint, signal);
+    await this.stateStore.replaceFileIndexByPath(rebuilt.index);
+    await this.stateStore.setCheckpoint(`cp_${rebuilt.checkpoint}`);
+    return rebuilt;
+  }
+
+  private async fetchRemoteIndexState(
+    client: SyncApiClient,
+    accessToken: string,
+    serverCheckpoint: number,
+    signal: AbortSignal
+  ): Promise<{ checkpoint: number; index: Record<string, IndexedFileState> }> {
+    if (serverCheckpoint === 0) {
+      return {
+        checkpoint: 0,
+        index: {}
+      };
+    }
+
+    let nextCheckpoint = 0;
+    let rebuiltIndex: Record<string, IndexedFileState> = {};
+    while (true) {
+      this.throwIfAborted(signal);
+      const pulled = await client.pull(accessToken, this.settings.vaultId, nextCheckpoint, 200, signal);
+      rebuiltIndex = applyRemoteChangesToIndex(rebuiltIndex, pulled.changes);
+      nextCheckpoint = this.checkpointToNumber(pulled.toCheckpoint);
+      if (!pulled.hasMore) {
+        break;
+      }
+    }
+
+    if (nextCheckpoint < serverCheckpoint) {
+      throw new Error(
+        `远端状态重建不完整：服务端检查点=cp_${serverCheckpoint}，重建到=cp_${nextCheckpoint}。`
+      );
+    }
+
+    return {
+      checkpoint: nextCheckpoint,
+      index: rebuiltIndex
+    };
   }
 
   private async uploadTargetsWithConcurrency(
