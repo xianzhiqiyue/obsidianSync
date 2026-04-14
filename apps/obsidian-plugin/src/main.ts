@@ -1,4 +1,4 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder } from "obsidian";
+import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, type TAbstractFile } from "obsidian";
 import {
   type SyncChangeRequest,
   type SyncConflict,
@@ -7,6 +7,12 @@ import {
   SyncApiClient,
   SyncApiError
 } from "./api-client";
+import {
+  formatActivitySummary,
+  normalizeActivityLog,
+  type SyncActivityItem,
+  type SyncActivityType
+} from "./activity-log";
 import {
   DEFAULT_LOCAL_SYNC_STATE,
   LocalStateStore,
@@ -25,7 +31,13 @@ import {
   pruneMissingFileIndexEntries
 } from "./sync-conflicts";
 import { applyRemoteChangesToIndex } from "./sync-remote-index";
-import { buildLocalPlan, isConflictCopyPath, normalizeQueuedChanges, type LocalFileSnapshot } from "./sync-planner";
+import {
+  buildLocalPlan,
+  isConflictCopyPath,
+  normalizeQueuedChanges,
+  type LocalFileSnapshot,
+  type LocalSyncPlan
+} from "./sync-planner";
 import {
   buildRemoteSummary,
   createTextPreview,
@@ -34,6 +46,18 @@ import {
 } from "./sync-conflict-candidates";
 import { shouldNotifyBlocked, shouldNotifyFailure } from "./sync-notify";
 import { runWithRetry } from "./sync-retry";
+import { buildConflictCopyPath } from "./conflict-copy";
+import { mergeJsonText } from "./json-merge";
+import { mergeMarkdownText } from "./markdown-merge";
+import { planMirrorRemoteActions } from "./mirror-remote";
+import { decideLastModifiedWins } from "./non-text-lww";
+import { RealtimeSyncClient } from "./realtime-client";
+import {
+  DEFAULT_DEVICE_SYNC_SETTINGS,
+  type DeviceSyncSettings,
+  normalizeDeviceSyncSettings,
+  shouldSyncPath as shouldSyncPathWithSettings
+} from "./sync-settings";
 
 type DevicePlatform = "macos" | "windows" | "android" | "ios" | "linux" | "unknown";
 
@@ -45,6 +69,7 @@ interface SyncPluginSettings {
   deviceName: string;
   syncIntervalMinutes: number;
   enableDebugPanel: boolean;
+  sync: DeviceSyncSettings;
 }
 
 interface AuthState {
@@ -58,6 +83,9 @@ interface PluginPersistedData {
   settings: SyncPluginSettings;
   state: LocalSyncState;
   auth: AuthState;
+  syncSettingsSignature: string;
+  needsRemoteBaselineRebuild: boolean;
+  activityLog: SyncActivityItem[];
 }
 
 const DEFAULT_SETTINGS: SyncPluginSettings = {
@@ -67,7 +95,8 @@ const DEFAULT_SETTINGS: SyncPluginSettings = {
   vaultId: "",
   deviceName: "obsidian-device",
   syncIntervalMinutes: 5,
-  enableDebugPanel: true
+  enableDebugPanel: true,
+  sync: DEFAULT_DEVICE_SYNC_SETTINGS
 };
 
 const DEFAULT_AUTH_STATE: AuthState = {
@@ -110,11 +139,23 @@ export default class CustomSyncPlugin extends Plugin {
   private lastSyncError: string | null = null;
   private lastBlockedNoticeAtMs = 0;
   private lastFailureNoticeAtMs = 0;
+  private realtimeClient: RealtimeSyncClient | null = null;
+  private realtimeStatus: "disabled" | "connecting" | "connected" | "disconnected" | "error" = "disabled";
+  private realtimeDetail: string | null = null;
+  private localChangeDebounceTimer: number | null = null;
+  private remoteApplyDepth = 0;
+  private suppressLocalChangeUntilMs = 0;
+  private activityLog: SyncActivityItem[] = [];
+  private syncSettingsSignature = "";
+  private needsRemoteBaselineRebuild = false;
 
   async onload(): Promise<void> {
     const loaded = await this.loadPersistedData();
     this.settings = loaded.settings;
     this.authState = loaded.auth;
+    this.syncSettingsSignature = loaded.syncSettingsSignature;
+    this.needsRemoteBaselineRebuild = loaded.needsRemoteBaselineRebuild;
+    this.activityLog = loaded.activityLog;
     this.stateStore = new LocalStateStore(loaded.state, async (state) => {
       await this.persist(state);
     });
@@ -155,9 +196,16 @@ export default class CustomSyncPlugin extends Plugin {
       name: "清理历史冲突文件",
       callback: () => void this.cleanLegacyConflictFiles()
     });
+    this.addCommand({
+      id: "custom-sync-copy-activity-log",
+      name: "复制同步活动日志",
+      callback: () => void this.copyActivityLog()
+    });
 
     this.setupTimer();
     this.setupForegroundResumeHooks();
+    this.setupLocalChangeWatcher();
+    this.setupRealtimeClient();
     new Notice("自建同步插件已加载");
   }
 
@@ -166,6 +214,12 @@ export default class CustomSyncPlugin extends Plugin {
       window.clearInterval(this.syncTimer);
       this.syncTimer = null;
     }
+    if (this.localChangeDebounceTimer !== null) {
+      window.clearTimeout(this.localChangeDebounceTimer);
+      this.localChangeDebounceTimer = null;
+    }
+    this.realtimeClient?.stop();
+    this.realtimeClient = null;
   }
 
   async login(): Promise<void> {
@@ -191,6 +245,7 @@ export default class CustomSyncPlugin extends Plugin {
         accessTokenExpiresAtMs: Date.now() + response.expiresIn * 1000
       };
       await this.persist();
+      this.setupRealtimeClient();
       new Notice(`登录成功。设备 ID=${response.deviceId}`);
     } catch (error) {
       new Notice(`登录失败：${this.stringifyError(error)}`);
@@ -200,6 +255,10 @@ export default class CustomSyncPlugin extends Plugin {
 
   async logout(): Promise<void> {
     this.authState = { ...DEFAULT_AUTH_STATE };
+    this.realtimeClient?.stop();
+    this.realtimeClient = null;
+    this.realtimeStatus = "disabled";
+    this.realtimeDetail = null;
     await this.persist();
     new Notice("已清除登录会话。");
   }
@@ -237,6 +296,17 @@ export default class CustomSyncPlugin extends Plugin {
   async clearPendingConflicts(): Promise<void> {
     await this.stateStore.clearPendingConflicts();
     new Notice("已清除待决冲突。");
+  }
+
+  async clearActivityLog(): Promise<void> {
+    this.activityLog = [];
+    await this.persist();
+    new Notice("已清除同步活动日志。");
+  }
+
+  async copyActivityLog(): Promise<void> {
+    await navigator.clipboard.writeText(this.getActivitySummary());
+    new Notice("已复制同步活动日志。");
   }
 
   async cleanLegacyConflictFiles(): Promise<void> {
@@ -355,26 +425,42 @@ export default class CustomSyncPlugin extends Plugin {
     let failedQueue = this.stateStore.getFailureState().failedQueue;
     const initialState = await client.getSyncState(token, this.settings.vaultId, signal);
     const initialServerCheckpoint = this.checkpointToNumber(initialState.checkpoint);
-    if (initialServerCheckpoint < initialCheckpoint) {
+    if (initialServerCheckpoint < initialCheckpoint || this.needsRemoteBaselineRebuild) {
       const rebuilt = await this.rebuildRemoteBaseline(client, token, initialServerCheckpoint, signal);
       initialCheckpoint = rebuilt.checkpoint;
       pullFromCheckpoint = rebuilt.checkpoint;
       currentIndex = rebuilt.index;
       failedQueue = [];
+      if (this.needsRemoteBaselineRebuild) {
+        this.needsRemoteBaselineRebuild = false;
+        this.syncSettingsSignature = this.createSyncSettingsSignature();
+        await this.persist(this.stateStore.getSnapshot());
+      }
       if (this.settings.enableDebugPanel) {
-        console.warn("[custom-sync] server checkpoint rolled back", {
+        console.warn("[custom-sync] remote baseline rebuilt", {
+          reason: initialServerCheckpoint < this.checkpointToNumber(localCheckpoint) ? "server_checkpoint_rollback" : "sync_settings_changed",
           localCheckpoint: localCheckpoint ?? "cp_0",
           serverCheckpoint: initialState.checkpoint,
           rebuiltCheckpoint: `cp_${rebuilt.checkpoint}`
         });
       }
       if (this.isInteractiveTrigger(this.lastSyncReason)) {
-        new Notice("检测到服务端检查点回退，已重建同步索引并重新计算本地变更。");
+        new Notice("已重建远端同步索引并重新计算本地变更。");
       }
     }
 
-    const localSnapshots = await this.collectLocalSnapshots(signal);
-    const localPlan = buildLocalPlan(failedQueue, localSnapshots, currentIndex);
+    const localSnapshots =
+      this.settings.sync.mode === "bidirectional" ? await this.collectLocalSnapshots(signal) : {};
+    const localPlan: LocalSyncPlan =
+      this.settings.sync.mode === "bidirectional"
+        ? buildLocalPlan(failedQueue, localSnapshots, currentIndex)
+        : {
+            source: "fresh",
+            changes: [],
+            queuePreview: [],
+            hashToSnapshot: {},
+            droppedFailedItems: 0
+          };
     await this.stateStore.replaceQueue(localPlan.queuePreview);
     if (this.settings.enableDebugPanel) {
       console.info("[custom-sync] local plan source", localPlan.source);
@@ -422,7 +508,14 @@ export default class CustomSyncPlugin extends Plugin {
       this.throwIfAborted(signal);
       const pulled = await client.pull(token, this.settings.vaultId, nextCheckpoint, 200, signal);
       if (pulled.changes.length > 0) {
-        updatedIndex = await this.applyRemoteChanges(client, token, updatedIndex, pulled.changes, signal);
+        const syncableChanges = pulled.changes.filter((change) => {
+          const decision = this.shouldSyncPath(change.path);
+          if (!decision.sync) {
+            this.recordActivity("skipped", decision.reason ?? "selective sync skipped remote change", change.path);
+          }
+          return decision.sync;
+        });
+        updatedIndex = await this.applyRemoteChangesWithSuppression(client, token, updatedIndex, syncableChanges, signal);
         await this.stateStore.replaceFileIndexByPath(updatedIndex);
       }
 
@@ -431,6 +524,13 @@ export default class CustomSyncPlugin extends Plugin {
       if (!pulled.hasMore) {
         break;
       }
+    }
+
+    if (this.settings.sync.mode === "mirror_remote") {
+      const remoteBaseline = await this.fetchRemoteIndexState(client, token, serverCheckpoint, signal);
+      updatedIndex = await this.reconcileMirrorRemote(client, token, remoteBaseline.index, signal);
+      await this.stateStore.replaceFileIndexByPath(updatedIndex);
+      await this.stateStore.setCheckpoint(`cp_${remoteBaseline.checkpoint}`);
     }
 
     await this.stateStore.clearQueue();
@@ -448,8 +548,14 @@ export default class CustomSyncPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
+    const nextSyncSettingsSignature = this.createSyncSettingsSignature();
+    if (this.syncSettingsSignature && nextSyncSettingsSignature !== this.syncSettingsSignature) {
+      this.needsRemoteBaselineRebuild = true;
+    }
+    this.syncSettingsSignature = nextSyncSettingsSignature;
     await this.persist();
     this.setupTimer();
+    this.setupRealtimeClient();
   }
 
   private async ensureAccessToken(signal?: AbortSignal): Promise<string> {
@@ -484,6 +590,23 @@ export default class CustomSyncPlugin extends Plugin {
     return new SyncApiClient(this.settings.apiBaseUrl.trim());
   }
 
+  private createSyncSettingsSignature(): string {
+    return JSON.stringify(normalizeDeviceSyncSettings(this.settings.sync));
+  }
+
+  private recordActivity(type: SyncActivityType, message: string, path?: string): void {
+    this.activityLog.unshift({ ts: Date.now(), type, message, path });
+    this.activityLog = normalizeActivityLog(this.activityLog);
+    void this.persist();
+    if (this.settings.enableDebugPanel) {
+      console.info("[custom-sync] activity", { type, message, path });
+    }
+  }
+
+  private shouldSyncPath(path: string): ReturnType<typeof shouldSyncPathWithSettings> {
+    return shouldSyncPathWithSettings(path, this.settings.sync);
+  }
+
   private detectPlatform(): DevicePlatform {
     if (this.app.isMobile) {
       return "android";
@@ -500,11 +623,14 @@ export default class CustomSyncPlugin extends Plugin {
     const data = (await this.loadData()) as Partial<PluginPersistedData> | null;
     const queue = normalizeQueuedChanges(data?.state?.queue);
     const failedQueue = normalizeQueuedChanges(data?.state?.failure?.failedQueue);
+    const settings: SyncPluginSettings = {
+      ...DEFAULT_SETTINGS,
+      ...(data?.settings ?? {}),
+      sync: normalizeDeviceSyncSettings(data?.settings?.sync)
+    };
+    const syncSettingsSignature = data?.syncSettingsSignature ?? JSON.stringify(normalizeDeviceSyncSettings(settings.sync));
     return {
-      settings: {
-        ...DEFAULT_SETTINGS,
-        ...(data?.settings ?? {})
-      },
+      settings,
       state: {
         checkpoint: data?.state?.checkpoint ?? DEFAULT_LOCAL_SYNC_STATE.checkpoint,
         queue,
@@ -526,7 +652,10 @@ export default class CustomSyncPlugin extends Plugin {
       auth: {
         ...DEFAULT_AUTH_STATE,
         ...(data?.auth ?? {})
-      }
+      },
+      syncSettingsSignature,
+      needsRemoteBaselineRebuild: data?.needsRemoteBaselineRebuild ?? false,
+      activityLog: normalizeActivityLog(data?.activityLog)
     };
   }
 
@@ -534,7 +663,10 @@ export default class CustomSyncPlugin extends Plugin {
     const persisted: PluginPersistedData = {
       settings: this.settings,
       state: stateOverride ?? this.stateStore.getSnapshot(),
-      auth: this.authState
+      auth: this.authState,
+      syncSettingsSignature: this.syncSettingsSignature || this.createSyncSettingsSignature(),
+      needsRemoteBaselineRebuild: this.needsRemoteBaselineRebuild,
+      activityLog: normalizeActivityLog(this.activityLog)
     };
     await this.saveData(persisted);
   }
@@ -543,10 +675,12 @@ export default class CustomSyncPlugin extends Plugin {
     const result: Record<string, LocalFileSnapshot> = {};
     for (const file of this.app.vault.getFiles()) {
       this.throwIfAborted(signal);
-      if (file.path.startsWith(".obsidian/")) {
+      if (isConflictCopyPath(file.path)) {
         continue;
       }
-      if (isConflictCopyPath(file.path)) {
+      const decision = this.shouldSyncPath(file.path);
+      if (!decision.sync) {
+        this.recordActivity("skipped", decision.reason ?? "selective sync skipped local snapshot", file.path);
         continue;
       }
       const bytes = await this.app.vault.readBinary(file);
@@ -554,7 +688,9 @@ export default class CustomSyncPlugin extends Plugin {
       result[file.path] = {
         path: file.path,
         contentHash,
-        bytes
+        bytes,
+        mtimeMs: file.stat.mtime,
+        ctimeMs: file.stat.ctime
       };
     }
     return result;
@@ -674,7 +810,9 @@ export default class CustomSyncPlugin extends Plugin {
             fileId: change.fileId,
             path: change.path,
             version: change.version,
-            contentHash: change.contentHash
+            contentHash: change.contentHash,
+            mtimeMs: change.mtimeMs,
+            ctimeMs: change.ctimeMs
           };
           fileIdToPath[change.fileId] = change.path;
           continue;
@@ -694,18 +832,80 @@ export default class CustomSyncPlugin extends Plugin {
           delete nextIndex[previousPath];
         }
 
-        await this.writeLocalFile(change.path, bytes, signal);
+        await this.writeLocalFile(change.path, bytes, signal, { mtimeMs: change.mtimeMs, ctimeMs: change.ctimeMs });
         nextIndex[change.path] = {
           fileId: change.fileId,
           path: change.path,
           version: change.version,
-          contentHash: change.contentHash
+          contentHash: change.contentHash,
+          mtimeMs: change.mtimeMs,
+          ctimeMs: change.ctimeMs
         };
         fileIdToPath[change.fileId] = change.path;
       }
     }
 
     return nextIndex;
+  }
+
+
+  private async reconcileMirrorRemote(
+    client: SyncApiClient,
+    accessToken: string,
+    remoteIndexByPath: Record<string, IndexedFileState>,
+    signal: AbortSignal
+  ): Promise<Record<string, IndexedFileState>> {
+    const localFiles: Array<{ path: string; contentHash: string }> = [];
+    for (const file of this.app.vault.getFiles()) {
+      this.throwIfAborted(signal);
+      if (isConflictCopyPath(file.path)) {
+        continue;
+      }
+      const bytes = await this.app.vault.readBinary(file);
+      localFiles.push({
+        path: file.path,
+        contentHash: await this.computeSha256(bytes)
+      });
+    }
+
+    const actions = planMirrorRemoteActions(localFiles, remoteIndexByPath, (path) => this.shouldSyncPath(path));
+    const restoreHashes = Array.from(new Set(actions.filter((action) => action.op === "restore").map((action) => action.contentHash)));
+    const bytesByHash = new Map<string, ArrayBuffer>();
+    if (restoreHashes.length > 0) {
+      const urls = await client.getDownloadUrls(accessToken, this.settings.vaultId, restoreHashes, signal);
+      const urlByHash = new Map(urls.items.map((item) => [item.contentHash, item.downloadUrl]));
+      for (const hash of restoreHashes) {
+        const url = urlByHash.get(hash);
+        if (!url) {
+          throw new Error(`缺少内容哈希 ${hash} 的下载地址。`);
+        }
+        bytesByHash.set(hash, await client.downloadObject(url, signal));
+      }
+    }
+
+    this.remoteApplyDepth += 1;
+    try {
+      for (const action of actions) {
+        this.throwIfAborted(signal);
+        if (action.op === "delete") {
+          await this.deleteLocalFileIfExists(action.path, signal);
+          this.recordActivity("delete", "mirror remote removed local-only file", action.path);
+          continue;
+        }
+
+        const bytes = bytesByHash.get(action.contentHash);
+        if (!bytes) {
+          throw new Error(`缺少内容哈希 ${action.contentHash} 对应的下载数据。`);
+        }
+        await this.writeLocalFile(action.path, bytes, signal);
+        this.recordActivity("download", "mirror remote restored modified local file", action.path);
+      }
+    } finally {
+      this.remoteApplyDepth -= 1;
+      this.suppressLocalChangeUntilMs = Date.now() + 1000;
+    }
+
+    return { ...remoteIndexByPath };
   }
 
   private async downloadBatchBytes(
@@ -745,19 +945,29 @@ export default class CustomSyncPlugin extends Plugin {
     return bytesByHash;
   }
 
-  private async writeLocalFile(path: string, bytes: ArrayBuffer, signal: AbortSignal): Promise<void> {
+  private async writeLocalFile(path: string, bytes: ArrayBuffer, signal: AbortSignal, timestamps?: { mtimeMs?: number; ctimeMs?: number }): Promise<void> {
     this.throwIfAborted(signal);
     await this.ensureParentFolder(path, signal);
     this.throwIfAborted(signal);
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing instanceof TFile) {
-      await this.app.vault.modifyBinary(existing, bytes);
+      await this.app.vault.modifyBinary(existing, bytes, this.toDataWriteOptions(timestamps));
       return;
     }
     if (existing instanceof TFolder) {
       throw new Error(`无法写入文件，目标路径是文件夹：${path}`);
     }
-    await this.app.vault.createBinary(path, bytes);
+    await this.app.vault.createBinary(path, bytes, this.toDataWriteOptions(timestamps));
+  }
+
+  private toDataWriteOptions(timestamps?: { mtimeMs?: number; ctimeMs?: number }): { mtime?: number; ctime?: number } | undefined {
+    if (!timestamps?.mtimeMs && !timestamps?.ctimeMs) {
+      return undefined;
+    }
+    return {
+      ...(timestamps.mtimeMs === undefined ? {} : { mtime: timestamps.mtimeMs }),
+      ...(timestamps.ctimeMs === undefined ? {} : { ctime: timestamps.ctimeMs })
+    };
   }
 
   private async renameLocalFileIfExists(fromPath: string, toPath: string, signal: AbortSignal): Promise<void> {
@@ -795,6 +1005,24 @@ export default class CustomSyncPlugin extends Plugin {
       await this.stateStore.replaceFileIndexByPath(repairedIndex);
     }
 
+    const autoResolvedFiles = await this.buildAutoResolvedConflictFiles(
+      client,
+      accessToken,
+      localPlan,
+      conflicts,
+      signal
+    );
+    if (autoResolvedFiles) {
+      await this.rebaseToRemoteState(client, accessToken, signal);
+      for (const item of autoResolvedFiles) {
+        await this.writeLocalFile(item.path, item.bytes, signal);
+        this.recordActivity("download", "auto-merged text conflict", item.path);
+      }
+      await this.stateStore.clearPendingConflicts();
+      new Notice(`已自动处理 ${autoResolvedFiles.length} 个冲突，正在重新提交。`);
+      return "retry";
+    }
+
     const pendingSummaries = await this.buildPendingConflictSummaries(localPlan, conflicts, signal);
     new Notice(`已保存 ${pendingSummaries.length} 个待处理冲突，当前已回到远端最新状态。`);
     if (interactive && this.hasRemoteDeletedConflicts(conflicts) && !signal.aborted) {
@@ -811,6 +1039,130 @@ export default class CustomSyncPlugin extends Plugin {
       return "retry";
     }
     return "pending";
+  }
+
+
+  private canAutoMergeTextPath(path: string): boolean {
+    return path.endsWith(".md") || path.endsWith(".json");
+  }
+
+  private async buildAutoResolvedConflictFiles(
+    client: SyncApiClient,
+    accessToken: string,
+    localPlan: { changes: SyncChangeRequest[]; hashToSnapshot: Record<string, LocalFileSnapshot> },
+    conflicts: SyncConflict[],
+    signal: AbortSignal
+  ): Promise<Array<{ path: string; bytes: ArrayBuffer }> | null> {
+    return this.settings.sync.conflictStrategy === "merge"
+      ? this.buildAutoMergedTextConflictFiles(client, accessToken, localPlan, conflicts, signal)
+      : this.buildLastModifiedWinsConflictFiles(client, accessToken, localPlan, conflicts, signal);
+  }
+
+  private async buildAutoMergedTextConflictFiles(
+    client: SyncApiClient,
+    accessToken: string,
+    localPlan: { changes: SyncChangeRequest[]; hashToSnapshot: Record<string, LocalFileSnapshot> },
+    conflicts: SyncConflict[],
+    signal: AbortSignal
+  ): Promise<Array<{ path: string; bytes: ArrayBuffer }> | null> {
+    const mergedFiles: Array<{ path: string; bytes: ArrayBuffer }> = [];
+    for (const conflict of conflicts) {
+      this.throwIfAborted(signal);
+      const change = localPlan.changes[conflict.index];
+      const path = change?.path ?? conflict.path;
+      if (conflict.code !== "VERSION_CONFLICT" || !change?.fileId || !this.canAutoMergeTextPath(path)) {
+        return null;
+      }
+      if (typeof change.baseVersion !== "number" || !conflict.remoteContentHash) {
+        return null;
+      }
+
+      const localBytes = await this.readConflictBytes(path, change.contentHash, localPlan.hashToSnapshot);
+      if (!localBytes) {
+        return null;
+      }
+      const baseVersionUrl = await client.getFileVersionDownloadUrl(
+        accessToken,
+        this.settings.vaultId,
+        change.fileId,
+        change.baseVersion,
+        signal
+      );
+      const remoteUrls = await client.getDownloadUrls(accessToken, this.settings.vaultId, [conflict.remoteContentHash], signal);
+      const remoteUrl = remoteUrls.items.find((item) => item.contentHash === conflict.remoteContentHash)?.downloadUrl;
+      if (!remoteUrl) {
+        return null;
+      }
+
+      const [baseBytes, remoteBytes] = await Promise.all([
+        client.downloadObject(baseVersionUrl.downloadUrl, signal),
+        client.downloadObject(remoteUrl, signal)
+      ]);
+      const baseText = this.decodeUtf8(baseBytes);
+      const localText = this.decodeUtf8(localBytes);
+      const remoteText = this.decodeUtf8(remoteBytes);
+      const merge = path.endsWith(".md")
+        ? mergeMarkdownText(baseText, localText, remoteText)
+        : mergeJsonText(baseText, localText, remoteText);
+      if (!merge.clean) {
+        return null;
+      }
+      mergedFiles.push({
+        path,
+        bytes: new TextEncoder().encode(merge.merged).buffer
+      });
+    }
+
+    return mergedFiles.length > 0 ? mergedFiles : null;
+  }
+
+
+  private async buildLastModifiedWinsConflictFiles(
+    client: SyncApiClient,
+    accessToken: string,
+    localPlan: { changes: SyncChangeRequest[]; hashToSnapshot: Record<string, LocalFileSnapshot> },
+    conflicts: SyncConflict[],
+    signal: AbortSignal
+  ): Promise<Array<{ path: string; bytes: ArrayBuffer }> | null> {
+    const files: Array<{ path: string; bytes: ArrayBuffer }> = [];
+    for (const conflict of conflicts) {
+      this.throwIfAborted(signal);
+      const change = localPlan.changes[conflict.index];
+      const path = change?.path ?? conflict.path;
+      if (conflict.code !== "VERSION_CONFLICT" || !change?.fileId) {
+        return null;
+      }
+
+      const decision = decideLastModifiedWins(path, change.mtimeMs, conflict.remoteMtimeMs);
+      if (decision === "defer") {
+        return null;
+      }
+
+      if (decision === "use_local") {
+        const localBytes = await this.readConflictBytes(path, change.contentHash, localPlan.hashToSnapshot);
+        if (!localBytes) {
+          return null;
+        }
+        files.push({ path, bytes: localBytes });
+        continue;
+      }
+
+      if (!conflict.remoteContentHash) {
+        return null;
+      }
+      const remoteUrls = await client.getDownloadUrls(accessToken, this.settings.vaultId, [conflict.remoteContentHash], signal);
+      const remoteUrl = remoteUrls.items.find((item) => item.contentHash === conflict.remoteContentHash)?.downloadUrl;
+      if (!remoteUrl) {
+        return null;
+      }
+      files.push({ path, bytes: await client.downloadObject(remoteUrl, signal) });
+    }
+
+    return files.length > 0 ? files : null;
+  }
+
+  private decodeUtf8(bytes: ArrayBuffer): string {
+    return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
   }
 
   private buildPendingConflictId(conflict: SyncConflict, path: string): string {
@@ -895,7 +1247,9 @@ export default class CustomSyncPlugin extends Plugin {
       if (!item.localContentBase64) {
         continue;
       }
-      await this.writeLocalFile(item.path, this.base64ToArrayBuffer(item.localContentBase64), signal);
+      const targetPath = buildConflictCopyPath(item.path, this.settings.deviceName);
+      await this.writeLocalFile(targetPath, this.base64ToArrayBuffer(item.localContentBase64), signal);
+      this.recordActivity("download", "created local conflict copy", targetPath);
     }
 
     await this.stateStore.clearPendingConflicts();
@@ -1204,6 +1558,10 @@ export default class CustomSyncPlugin extends Plugin {
     if (reason === "settings-button") return "设置页按钮触发";
     if (reason === "interval") return "定时触发";
     if (reason === "queued") return "排队触发";
+    if (reason === "remote-checkpoint") return "远端变更推送";
+    if (reason.startsWith("local-change:")) {
+      return `本地变更（${reason.slice("local-change:".length)}）`;
+    }
     if (reason.startsWith("foreground:")) {
       const trigger = reason.slice("foreground:".length);
       return `前台唤醒（${trigger}）`;
@@ -1221,6 +1579,10 @@ export default class CustomSyncPlugin extends Plugin {
       `最近触发=${this.formatSyncReason(this.lastSyncReason)} 结果=${this.formatSyncResult(this.lastSyncResult)}`,
       `最近开始=${this.formatTime(this.lastSyncStartedAtMs)} 最近结束=${this.formatTime(this.lastSyncFinishedAtMs)}`,
       `检查点=${snapshot.checkpoint ?? "-"}`,
+      `实时通道=${this.formatRealtimeStatus()}${this.realtimeDetail ? ` (${this.realtimeDetail})` : ""}`,
+      `同步模式=${this.settings.sync.mode} 排除文件夹=${this.settings.sync.excludedFolders.join(",") || "-"}`,
+      `待重建远端基线=${this.needsRemoteBaselineRebuild ? "是" : "否"}`,
+      `最近跳过=${this.activityLog.find((item) => item.type === "skipped")?.message ?? "-"}`,
       `队列长度=${snapshot.queue.length} 失败队列长度=${failure.failedQueue.length}`,
       `待处理冲突=${snapshot.pendingConflicts.items.length} 延后时间=${this.formatTime(snapshot.pendingConflicts.deferredAt)}`,
       `失败阻塞=${failure.blocked ? "是" : "否"} 连续失败=${failure.consecutiveFailures}`,
@@ -1228,11 +1590,117 @@ export default class CustomSyncPlugin extends Plugin {
     ].join("\n");
   }
 
+  private formatRealtimeStatus(): string {
+    const mappings: Record<typeof this.realtimeStatus, string> = {
+      disabled: "未启用",
+      connecting: "连接中",
+      connected: "已连接",
+      disconnected: "已断开",
+      error: "错误"
+    };
+    return mappings[this.realtimeStatus];
+  }
+
+  getActivitySummary(): string {
+    return formatActivitySummary(this.activityLog);
+  }
+
   private formatTime(ts: number | null): string {
     if (!ts) {
       return "-";
     }
     return new Date(ts).toLocaleString();
+  }
+
+  private setupLocalChangeWatcher(): void {
+    const handleChange = (kind: string, file: TAbstractFile | null) => {
+      if (!file) {
+        return;
+      }
+      this.scheduleLocalChangeSync(kind, file.path);
+    };
+
+    this.registerEvent(this.app.vault.on("create", (file) => handleChange("create", file)));
+    this.registerEvent(this.app.vault.on("modify", (file) => handleChange("modify", file)));
+    this.registerEvent(this.app.vault.on("delete", (file) => handleChange("delete", file)));
+    this.registerEvent(this.app.vault.on("rename", (file) => handleChange("rename", file)));
+  }
+
+  private scheduleLocalChangeSync(kind: string, path: string): void {
+    if (this.remoteApplyDepth > 0 || Date.now() < this.suppressLocalChangeUntilMs) {
+      return;
+    }
+    if (this.settings.sync.mode !== "bidirectional" || !this.settings.vaultId) {
+      if (this.settings.sync.mode !== "bidirectional") {
+        this.recordActivity("skipped", `local change ignored in ${this.settings.sync.mode} mode`, path);
+      }
+      return;
+    }
+    const decision = this.shouldSyncPath(path);
+    if (!decision.sync) {
+      this.recordActivity("skipped", decision.reason ?? `local ${kind} skipped by selective sync`, path);
+      return;
+    }
+
+    if (this.settings.enableDebugPanel) {
+      console.info("[custom-sync] local vault change", { kind, path });
+    }
+
+    if (this.localChangeDebounceTimer !== null) {
+      window.clearTimeout(this.localChangeDebounceTimer);
+    }
+    this.localChangeDebounceTimer = window.setTimeout(() => {
+      this.localChangeDebounceTimer = null;
+      void this.runSyncOnce(`local-change:${kind}`);
+    }, 1500);
+  }
+
+  private setupRealtimeClient(): void {
+    this.realtimeClient?.stop();
+    this.realtimeClient = null;
+    this.realtimeDetail = null;
+
+    if (!this.settings.vaultId || !this.authState.refreshToken) {
+      this.realtimeStatus = "disabled";
+      return;
+    }
+
+    this.realtimeClient = new RealtimeSyncClient({
+      baseUrl: this.settings.apiBaseUrl.trim(),
+      vaultId: this.settings.vaultId,
+      getAccessToken: async () => this.ensureAccessToken(),
+      getDeviceId: () => this.authState.deviceId,
+      onCheckpoint: (event) => {
+        if (this.settings.enableDebugPanel) {
+          console.info("[custom-sync] remote checkpoint event", event);
+        }
+        void this.runSyncOnce("remote-checkpoint");
+      },
+      onStatusChange: (status, detail) => {
+        this.realtimeStatus = status;
+        this.realtimeDetail = detail ?? null;
+        if (this.settings.enableDebugPanel) {
+          console.info("[custom-sync] realtime status", { status, detail });
+        }
+      }
+    });
+    this.realtimeClient.start();
+  }
+
+  private async applyRemoteChangesWithSuppression(
+    client: SyncApiClient,
+    accessToken: string,
+    currentIndex: Record<string, IndexedFileState>,
+    remoteChanges: SyncPullChange[],
+    signal: AbortSignal
+  ): Promise<Record<string, IndexedFileState>> {
+    this.remoteApplyDepth += 1;
+    try {
+      return await this.applyRemoteChanges(client, accessToken, currentIndex, remoteChanges, signal);
+    } finally {
+      this.remoteApplyDepth -= 1;
+      this.suppressLocalChangeUntilMs = Date.now() + 1000;
+    }
   }
 
   private setupForegroundResumeHooks(): void {
@@ -1366,11 +1834,87 @@ class SyncSettingTab extends PluginSettingTab {
         })
       );
 
+    containerEl.createEl("h3", { text: "选择性同步（官方 Sync 兼容模式）" });
+
+    new Setting(containerEl)
+      .setName("同步模式")
+      .setDesc("双向同步会上传本地变更；仅拉取/镜像远端不会上传本地变更。镜像远端删除本地多余文件将在后续阶段补齐。")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("bidirectional", "双向同步")
+          .addOption("pull_only", "仅拉取")
+          .addOption("mirror_remote", "镜像远端")
+          .setValue(this.plugin.settings.sync.mode)
+          .onChange(async (value) => {
+            this.plugin.settings.sync.mode = value as typeof this.plugin.settings.sync.mode;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("冲突处理策略")
+      .setDesc("自动合并会尝试安全合并 Markdown/JSON；创建冲突副本会保留远端原文件并保存本地副本。")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("merge", "自动合并")
+          .addOption("conflict_copy", "创建冲突副本")
+          .setValue(this.plugin.settings.sync.conflictStrategy)
+          .onChange(async (value) => {
+            this.plugin.settings.sync.conflictStrategy = value as typeof this.plugin.settings.sync.conflictStrategy;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("排除文件夹")
+      .setDesc("逗号分隔，例如：private,archive/tmp。排除路径不会上传，也会跳过远端应用。")
+      .addText((text) =>
+        text.setValue(this.plugin.settings.sync.excludedFolders.join(",")).onChange(async (value) => {
+          this.plugin.settings.sync.excludedFolders = value
+            .split(",")
+            .map((item) => item.trim())
+            .filter((item) => item.length > 0);
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("同步 PDF")
+      .setDesc("关闭后 PDF 附件不会上传或应用远端变更。")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.sync.attachmentTypes.pdf).onChange(async (value) => {
+          this.plugin.settings.sync.attachmentTypes.pdf = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("同步未知附件类型")
+      .setDesc("对应官方 unsupported file types；关闭后未知扩展名文件会被跳过。")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.sync.attachmentTypes.unsupported).onChange(async (value) => {
+          this.plugin.settings.sync.attachmentTypes.unsupported = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("同步 Obsidian app 设置")
+      .setDesc("默认关闭以保持旧行为；开启后允许同步 .obsidian/app.json。")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.sync.configSync.app).onChange(async (value) => {
+          this.plugin.settings.sync.configSync.app = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
     const statusContainer = containerEl.createDiv();
     statusContainer.createEl("h3", { text: "同步运行状态" });
     const statusEl = statusContainer.createEl("pre");
+    const activityEl = statusContainer.createEl("pre");
     const refreshStatus = () => {
       statusEl.setText(this.plugin.getRuntimeStatusSummary());
+      activityEl.setText(this.plugin.getActivitySummary());
     };
     refreshStatus();
 
@@ -1439,6 +1983,11 @@ class SyncSettingTab extends PluginSettingTab {
           refreshStatus();
           refreshPendingConflicts();
         })
+      )
+      .addButton((button) =>
+        button.setButtonText("复制活动日志").onClick(async () => {
+          await this.plugin.copyActivityLog();
+        })
       );
 
     new Setting(containerEl)
@@ -1472,6 +2021,16 @@ class SyncSettingTab extends PluginSettingTab {
       .addButton((button) =>
         button.setButtonText("清除失败状态").onClick(async () => {
           await this.plugin.clearFailureState();
+        })
+      )
+      .addButton((button) =>
+        button.setButtonText("清除活动日志").onClick(async () => {
+          await this.plugin.clearActivityLog();
+        })
+      )
+      .addButton((button) =>
+        button.setButtonText("复制活动日志").onClick(async () => {
+          await this.plugin.copyActivityLog();
         })
       );
   }

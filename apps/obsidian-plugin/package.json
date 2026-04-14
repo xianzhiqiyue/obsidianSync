@@ -9,9 +9,11 @@
     "test": "tsx --test src/**/*.test.ts"
   },
   "dependencies": {
+    "diff-match-patch": "^1.0.5",
     "obsidian": "^1.8.0"
   },
   "devDependencies": {
+    "@types/diff-match-patch": "^1.0.36",
     "@types/node": "^22.10.1",
     "esbuild": "^0.24.2",
     "tsx": "^4.19.2",
