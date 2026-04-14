@@ -1,12 +1,13 @@
 import type { SyncChangeRequest } from "./api-client";
+import { isConflictCopyPath as isConflictCopyPathFromConflictCopy } from "./conflict-copy";
 import type { IndexedFileState, QueuedChange } from "./state-store";
-
-const CONFLICT_COPY_MARKER = ".conflict-";
 
 export interface LocalFileSnapshot {
   path: string;
   contentHash: string;
   bytes: ArrayBuffer;
+  mtimeMs?: number;
+  ctimeMs?: number;
 }
 
 export interface LocalSyncPlan {
@@ -32,6 +33,10 @@ const DEFAULT_OPTIONS: PlannerRuntimeOptions = {
   newId: () => crypto.randomUUID()
 };
 
+export function isConflictCopyPath(path: string): boolean {
+  return isConflictCopyPathFromConflictCopy(path);
+}
+
 export function buildLocalPlan(
   failedQueue: QueuedChange[],
   localSnapshots: Record<string, LocalFileSnapshot>,
@@ -46,10 +51,6 @@ export function buildLocalPlan(
   }
 
   return planLocalChanges(localSnapshots, fileIndexByPath, options);
-}
-
-export function isConflictCopyPath(path: string): boolean {
-  return path.includes(CONFLICT_COPY_MARKER);
 }
 
 export function planReplayChanges(
@@ -138,7 +139,9 @@ export function planLocalChanges(
           op,
           fileId: matched.fileId,
           path: snapshot.path,
-          baseVersion: matched.version
+          baseVersion: matched.version,
+          mtimeMs: snapshot.mtimeMs,
+          ...(snapshot.ctimeMs === undefined ? {} : { ctimeMs: snapshot.ctimeMs })
         };
         changes.push(change);
         queuePreview.push(toQueuedChange(change, runtimeOptions));
@@ -149,7 +152,9 @@ export function planLocalChanges(
       const change: SyncChangeRequest = {
         op: "create",
         path: snapshot.path,
-        contentHash: snapshot.contentHash
+        contentHash: snapshot.contentHash,
+        mtimeMs: snapshot.mtimeMs,
+        ...(snapshot.ctimeMs === undefined ? {} : { ctimeMs: snapshot.ctimeMs })
       };
       changes.push(change);
       queuePreview.push(toQueuedChange(change, runtimeOptions));
@@ -167,7 +172,9 @@ export function planLocalChanges(
         fileId: indexed.fileId,
         path: snapshot.path,
         baseVersion: indexed.version,
-        contentHash: snapshot.contentHash
+        contentHash: snapshot.contentHash,
+        mtimeMs: snapshot.mtimeMs,
+        ...(snapshot.ctimeMs === undefined ? {} : { ctimeMs: snapshot.ctimeMs })
       };
       changes.push(change);
       queuePreview.push(toQueuedChange(change, runtimeOptions));
@@ -206,7 +213,9 @@ export function toSyncChangeRequest(change: QueuedChange): SyncChangeRequest | n
       return {
         op: "create",
         path: change.path,
-        contentHash: change.contentHash
+        contentHash: change.contentHash,
+        mtimeMs: change.mtimeMs,
+        ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
       };
     case "update":
       if (!change.fileId || !hasBaseVersion || !change.contentHash) {
@@ -217,7 +226,9 @@ export function toSyncChangeRequest(change: QueuedChange): SyncChangeRequest | n
         fileId: change.fileId,
         path: change.path,
         baseVersion: change.baseVersion,
-        contentHash: change.contentHash
+        contentHash: change.contentHash,
+        mtimeMs: change.mtimeMs,
+        ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
       };
     case "delete":
       if (!change.fileId || !hasBaseVersion) {
@@ -227,7 +238,9 @@ export function toSyncChangeRequest(change: QueuedChange): SyncChangeRequest | n
         op: "delete",
         fileId: change.fileId,
         path: change.path,
-        baseVersion: change.baseVersion
+        baseVersion: change.baseVersion,
+        mtimeMs: change.mtimeMs,
+        ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
       };
     case "rename":
     case "move":
@@ -238,7 +251,9 @@ export function toSyncChangeRequest(change: QueuedChange): SyncChangeRequest | n
         op: change.op,
         fileId: change.fileId,
         path: change.path,
-        baseVersion: change.baseVersion
+        baseVersion: change.baseVersion,
+        mtimeMs: change.mtimeMs,
+        ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
       };
     default:
       return null;
@@ -324,6 +339,10 @@ export function normalizeQueuedChanges(rawQueue: unknown, options?: PlannerOptio
     const contentHash = typeof raw.contentHash === "string" && raw.contentHash.length > 0 ? raw.contentHash : undefined;
     const attempts =
       typeof raw.attempts === "number" && Number.isFinite(raw.attempts) && raw.attempts >= 0 ? raw.attempts : 0;
+    const rawMtimeMs = raw.mtimeMs;
+    const mtimeMs = typeof rawMtimeMs === "number" && Number.isFinite(rawMtimeMs) ? rawMtimeMs : undefined;
+    const rawCtimeMs = raw.ctimeMs;
+    const ctimeMs = typeof rawCtimeMs === "number" && Number.isFinite(rawCtimeMs) ? rawCtimeMs : undefined;
     const ts = typeof raw.ts === "number" && Number.isFinite(raw.ts) ? raw.ts : runtimeOptions.now();
 
     result.push({
@@ -333,6 +352,8 @@ export function normalizeQueuedChanges(rawQueue: unknown, options?: PlannerOptio
       fileId,
       baseVersion,
       contentHash,
+      ...(mtimeMs === undefined ? {} : { mtimeMs }),
+      ...(ctimeMs === undefined ? {} : { ctimeMs }),
       attempts,
       ts
     });
@@ -361,6 +382,8 @@ function toQueuedChange(change: SyncChangeRequest, options: PlannerRuntimeOption
     fileId: change.fileId,
     baseVersion: change.baseVersion,
     contentHash: change.contentHash,
+    ...(change.mtimeMs === undefined ? {} : { mtimeMs: change.mtimeMs }),
+    ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs }),
     attempts,
     ts: options.now()
   };

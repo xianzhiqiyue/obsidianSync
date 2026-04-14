@@ -3,11 +3,12 @@ import test from "node:test";
 import { buildLocalPlan, isConflictCopyPath, normalizeQueuedChanges, planLocalChanges } from "./sync-planner";
 import type { IndexedFileState, QueuedChange } from "./state-store";
 
-function makeSnapshot(path: string, contentHash: string) {
+function makeSnapshot(path: string, contentHash: string, mtimeMs = 1000) {
   return {
     path,
     contentHash,
-    bytes: new ArrayBuffer(0)
+    bytes: new ArrayBuffer(0),
+    mtimeMs
   };
 }
 
@@ -84,7 +85,8 @@ test("buildLocalPlan falls back to fresh scan when failed queue cannot replay", 
   assert.deepEqual(plan.changes[0], {
     op: "create",
     path: "notes/new.md",
-    contentHash: "sha256:new-file"
+    contentHash: "sha256:new-file",
+    mtimeMs: 1000
   });
   assert.equal(plan.queuePreview.length, 1);
   assert.equal(plan.queuePreview[0]?.id, "generated-id");
@@ -124,13 +126,15 @@ test("planLocalChanges detects move and rename from matching content hash", () =
     op: "move",
     fileId: "33333333-3333-3333-3333-333333333333",
     path: "notes/a.md",
-    baseVersion: 3
+    baseVersion: 3,
+    mtimeMs: 1000
   });
   assert.deepEqual(plan.changes[1], {
     op: "rename",
     fileId: "44444444-4444-4444-4444-444444444444",
     path: "notes/new.md",
-    baseVersion: 7
+    baseVersion: 7,
+    mtimeMs: 1000
   });
   assert.equal(plan.queuePreview.length, 2);
   assert.equal(plan.queuePreview[0]?.id, "id-1");

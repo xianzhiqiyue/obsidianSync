@@ -19,7 +19,8 @@ test("applyRemoteChangesToIndex rebuilds latest index across create update renam
       fileId: "file-a",
       path: "notes/a.md",
       version: 2,
-      contentHash: "sha256:a2"
+      contentHash: "sha256:a2",
+      mtimeMs: undefined
     },
     {
       op: "rename",
@@ -33,7 +34,8 @@ test("applyRemoteChangesToIndex rebuilds latest index across create update renam
       fileId: "file-b",
       path: "notes/b.md",
       version: 1,
-      contentHash: "sha256:b1"
+      contentHash: "sha256:b1",
+      mtimeMs: undefined
     },
     {
       op: "delete",

@@ -24,6 +24,7 @@ interface PrepareResponse {
     remotePath?: string;
     remoteDeleted?: boolean;
     existingFileId?: string;
+    remoteContentHash?: string;
   }>;
 }
 
@@ -133,7 +134,9 @@ test("sync commit should be idempotent for same idempotency key", async () => {
           {
             op: "create",
             path,
-            contentHash
+            contentHash,
+            mtimeMs: 1111,
+            ctimeMs: 2222
           }
         ]
       }
@@ -160,6 +163,17 @@ test("sync commit should be idempotent for same idempotency key", async () => {
     assert.equal(firstBody.appliedChanges, 1);
     assert.equal(firstBody.newCheckpoint, "cp_1");
     assert.match(firstBody.changesetId, /^[0-9a-f-]{36}$/i);
+
+    const pullRes = await context.app.inject({
+      method: "GET",
+      url: `/api/v1/vaults/${context.vaultId}/sync/pull?fromCheckpoint=0`,
+      headers: {
+        authorization: `Bearer ${context.accessToken}`
+      }
+    });
+    assert.equal(pullRes.statusCode, 200);
+    assert.equal(pullRes.json().changes[0]?.mtimeMs, 1111);
+    assert.equal(pullRes.json().changes[0]?.ctimeMs, 2222);
 
     const commitSecondRes = await context.app.inject({
       method: "POST",
@@ -629,6 +643,78 @@ test("sync commit should fail when uploaded object is missing", async () => {
   } finally {
     await destroyTestContext(context);
     await cleanupObjectHashes([missingHash]);
+  }
+});
+
+
+test("file version download-url should return content hash and signed URL", async () => {
+  const contentHash = `sha256:test-version-download-${randomUUID()}`;
+  const existingHashes = new Set([contentHash]);
+  const context = await createTestContext(existingHashes);
+  try {
+    const path = `notes/version-download-${randomUUID()}.md`;
+    const prepareRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+      headers: {
+        authorization: `Bearer ${context.accessToken}`
+      },
+      payload: {
+        baseCheckpoint: 0,
+        changes: [
+          {
+            op: "create",
+            path,
+            contentHash
+          }
+        ]
+      }
+    });
+    assert.equal(prepareRes.statusCode, 200);
+    const prepareBody = prepareRes.json() as PrepareResponse;
+    assert.equal(prepareBody.conflicts.length, 0);
+
+    const commitRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: {
+        authorization: `Bearer ${context.accessToken}`
+      },
+      payload: {
+        prepareId: prepareBody.prepareId,
+        idempotencyKey: randomUUID()
+      }
+    });
+    assert.equal(commitRes.statusCode, 200);
+
+    const fileResult = await query<{ id: string }>(
+      `SELECT id
+       FROM file_entries
+       WHERE vault_id = $1
+         AND current_path = $2
+       LIMIT 1`,
+      [context.vaultId, path]
+    );
+    const fileId = fileResult.rows[0]?.id;
+    assert.ok(fileId, "missing created file id");
+
+    const downloadRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/files/${fileId}/versions/1/download-url`,
+      headers: {
+        authorization: `Bearer ${context.accessToken}`
+      }
+    });
+    assert.equal(downloadRes.statusCode, 200);
+    assert.deepEqual(downloadRes.json(), {
+      fileId,
+      version: 1,
+      contentHash,
+      downloadUrl: `https://download.example.local/${encodeURIComponent(contentHash)}`
+    });
+  } finally {
+    await destroyTestContext(context);
+    await cleanupObjectHashes([contentHash]);
   }
 });
 
