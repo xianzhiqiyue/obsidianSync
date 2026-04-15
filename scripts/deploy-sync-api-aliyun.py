@@ -109,11 +109,32 @@ for _ in $(seq 1 15); do
   sleep 1
 done
 if ss -ltn | grep -q ':3000 '; then
-  echo "port 3000 is still busy after stop attempt" >&2
+  PIDS="$(ss -ltnp | awk -F'pid=' '/:3000 /{{split($2,a,","); print a[1]}}' | sort -u | tr '\n' ' ')"
+  if [ -n "$PIDS" ]; then
+    echo "stopping stale sync-api listener pids: $PIDS"
+    kill $PIDS 2>/dev/null || true
+  fi
+fi
+for _ in $(seq 1 10); do
+  if ! ss -ltn | grep -q ':3000 '; then
+    break
+  fi
+  sleep 1
+done
+if ss -ltn | grep -q ':3000 '; then
+  echo "port 3000 is still busy after stale listener stop attempt" >&2
+  ss -ltnp | grep ':3000 ' >&2 || true
   exit 1
 fi
-su - {remote_user} -c 'cd {remote_dir}/apps/sync-api && nohup /usr/bin/node dist/index.js >> {remote_dir}/logs/sync-api.log 2>&1 < /dev/null & echo $! > {remote_dir}/run/sync-api.pid'
+su - {remote_user} -c 'cd {remote_dir}/apps/sync-api && setsid /usr/bin/node dist/index.js >> {remote_dir}/logs/sync-api.log 2>&1 < /dev/null &'
 sleep 2
+NODE_PID="$(ss -ltnp | awk -F'pid=' '/:3000 /{{split($2,a,","); print a[1]; exit}}')"
+if [ -z "$NODE_PID" ]; then
+  echo "sync-api did not start listening on port 3000" >&2
+  tail -80 "$LOG_DIR/sync-api.log" >&2 || true
+  exit 1
+fi
+echo "$NODE_PID" > "$RUN_DIR/sync-api.pid"
 curl -fsS {health_url}
 echo
 curl -fsS {ready_url}
