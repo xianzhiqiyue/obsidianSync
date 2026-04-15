@@ -74,6 +74,17 @@ async function issueTokenPair(
 
 export default async function authRoutes(app: FastifyInstance): Promise<void> {
   app.post("/auth/bootstrap-admin", async (request, reply) => {
+    const providedToken = request.headers["x-bootstrap-token"];
+    const hasValidBootstrapToken =
+      typeof providedToken === "string" &&
+      appConfig.bootstrapAdminToken !== undefined &&
+      providedToken === appConfig.bootstrapAdminToken;
+    if (appConfig.env === "production" || appConfig.bootstrapAdminToken) {
+      if (!hasValidBootstrapToken) {
+        return reply.code(404).send({ code: "NOT_FOUND", message: "route not found" });
+      }
+    }
+
     const existing = await query<{ id: string }>("SELECT id FROM users WHERE email = $1", [
       appConfig.seedAdminEmail
     ]);

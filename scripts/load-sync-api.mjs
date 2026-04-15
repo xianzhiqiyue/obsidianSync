@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -25,6 +25,8 @@ const toRate = (value, fallback) => {
   if (n > 1) return 1;
   return n;
 };
+
+const sha256ContentHash = (content) => `sha256:${createHash("sha256").update(content).digest("hex")}`;
 
 const parseCheckpoint = (value) => {
   if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
@@ -432,7 +434,8 @@ const runWorker = async (workerIndex) => {
     }
 
     const cpBefore = checkpoint;
-    const contentHash = `sha256:load-${randomUUID()}`;
+    const content = `load-content worker=${workerId} iter=${iter} nonce=${randomUUID()}`;
+    const contentHash = sha256ContentHash(content);
     const filePath = `load/w${workerId}/note-${iter}.md`;
 
     const prepareResp = await request({

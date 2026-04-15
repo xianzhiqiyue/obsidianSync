@@ -8,17 +8,18 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "migrate": "tsx src/migrate.ts",
-    "test": "tsx --test src/**/*.test.ts"
+    "test": "node scripts/run-tests.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.888.0",
-    "@aws-sdk/s3-request-presigner": "^3.888.0",
+    "@aws-sdk/client-s3": "^3.1030.0",
+    "@aws-sdk/s3-request-presigner": "^3.1030.0",
     "@fastify/cors": "^10.0.0",
-    "@fastify/jwt": "^9.0.0",
+    "@fastify/jwt": "^10.0.0",
     "dotenv": "^16.4.5",
-    "fastify": "^5.0.0",
-    "pino": "^9.5.0",
+    "fastify": "^5.8.5",
     "pg": "^8.13.1",
+    "pino": "^9.5.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

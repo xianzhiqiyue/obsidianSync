@@ -13,8 +13,8 @@ new_uuid() {
   node -e 'const { randomUUID } = require("crypto"); process.stdout.write(randomUUID());'
 }
 
-new_hash() {
-  node -e 'const { randomUUID } = require("crypto"); process.stdout.write(`sha256:reg-${randomUUID()}`);'
+hash_content() {
+  node -e 'const { createHash } = require("crypto"); process.stdout.write(`sha256:${createHash("sha256").update(process.argv[1]).digest("hex")}`);' "$1"
 }
 
 checkpoint_to_num() {
@@ -55,7 +55,8 @@ state0=$(curl -sS "$BASE_URL/vaults/$vault_id/sync/state" -H "authorization: Bea
 cp0=$(checkpoint_to_num "$(node -e 'const j=JSON.parse(process.argv[1]); process.stdout.write(j.checkpoint || "cp_0");' "$state0")")
 
 # Step 1: device A creates notes/conflict.md
-hash_a1=$(new_hash)
+content_a1="reg-conflict-create-$(date +%s)-$(new_uuid)"
+hash_a1=$(hash_content "$content_a1")
 payload_create=$(node -e 'const cp=Number(process.argv[1]); const hash=process.argv[2]; process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "create", path: "notes/conflict.md", contentHash: hash}]}));' "$cp0" "$hash_a1")
 prepare_create=$(curl -sS -X POST "$BASE_URL/vaults/$vault_id/sync/prepare" \
   -H "authorization: Bearer $token_a" \
@@ -65,7 +66,7 @@ prepare_create_id=$(node -e 'const j=JSON.parse(process.argv[1]); process.stdout
 [ -n "$prepare_create_id" ]
 upload_create_url=$(node -e 'const j=JSON.parse(process.argv[1]); process.stdout.write(j.uploadTargets?.[0]?.uploadUrl || "");' "$prepare_create")
 if [ -n "$upload_create_url" ]; then
-  curl -sS -X PUT "$upload_create_url" --data-binary "reg-conflict-create-$(date +%s)" >/dev/null
+  curl -sS -X PUT "$upload_create_url" --data-binary "$content_a1" >/dev/null
 fi
 
 commit_create=$(curl -sS -X POST "$BASE_URL/vaults/$vault_id/sync/commit" \
@@ -82,7 +83,8 @@ version_after_create=$(node -e 'const j=JSON.parse(process.argv[1]); const c=(j.
 [ -n "$version_after_create" ]
 
 # Step 2: device B updates same file, committing version+1
-hash_b2=$(new_hash)
+content_b2="reg-conflict-update-$(date +%s)-$(new_uuid)"
+hash_b2=$(hash_content "$content_b2")
 payload_update_b=$(node -e 'const cp=Number(process.argv[1]); const fileId=process.argv[2]; const baseVersion=Number(process.argv[3]); const hash=process.argv[4]; process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "update", fileId, path: "notes/conflict.md", baseVersion, contentHash: hash}]}));' "$cp_after_create" "$file_id" "$version_after_create" "$hash_b2")
 prepare_update_b=$(curl -sS -X POST "$BASE_URL/vaults/$vault_id/sync/prepare" \
   -H "authorization: Bearer $token_b" \
@@ -92,7 +94,7 @@ prepare_update_b_id=$(node -e 'const j=JSON.parse(process.argv[1]); process.stdo
 [ -n "$prepare_update_b_id" ]
 upload_update_b_url=$(node -e 'const j=JSON.parse(process.argv[1]); process.stdout.write(j.uploadTargets?.[0]?.uploadUrl || "");' "$prepare_update_b")
 if [ -n "$upload_update_b_url" ]; then
-  curl -sS -X PUT "$upload_update_b_url" --data-binary "reg-conflict-update-$(date +%s)" >/dev/null
+  curl -sS -X PUT "$upload_update_b_url" --data-binary "$content_b2" >/dev/null
 fi
 commit_update_b=$(curl -sS -X POST "$BASE_URL/vaults/$vault_id/sync/commit" \
   -H "authorization: Bearer $token_b" \
@@ -106,7 +108,8 @@ version_after_update_b=$(node -e 'const j=JSON.parse(process.argv[1]); const c=(
 [ -n "$version_after_update_b" ]
 
 # Step 3: device A retries stale update with old baseVersion -> VERSION_CONFLICT
-hash_a2=$(new_hash)
+content_a2="reg-stale-update-$(date +%s)-$(new_uuid)"
+hash_a2=$(hash_content "$content_a2")
 payload_stale_update_a=$(node -e 'const cp=Number(process.argv[1]); const fileId=process.argv[2]; const staleVersion=Number(process.argv[3]); const hash=process.argv[4]; process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "update", fileId, path: "notes/conflict.md", baseVersion: staleVersion, contentHash: hash}]}));' "$cp_after_update_b" "$file_id" "$version_after_create" "$hash_a2")
 prepare_stale_update_a=$(curl -sS -X POST "$BASE_URL/vaults/$vault_id/sync/prepare" \
   -H "authorization: Bearer $token_a" \
@@ -136,7 +139,8 @@ rename_event_ok=$(node -e 'const j=JSON.parse(process.argv[1]); const fileId=pro
 assert_true "$rename_event_ok" "rename event missing or fileId changed"
 
 # Step 5: commit idempotency replay returns same response
-hash_idempotency=$(new_hash)
+content_idempotency="reg-idempotency-$(date +%s)-$(new_uuid)"
+hash_idempotency=$(hash_content "$content_idempotency")
 payload_create_idempotency=$(node -e 'const cp=Number(process.argv[1]); const hash=process.argv[2]; process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "create", path: "notes/idempotency.md", contentHash: hash}]}));' "$cp_after_rename_b" "$hash_idempotency")
 prepare_idempotency=$(curl -sS -X POST "$BASE_URL/vaults/$vault_id/sync/prepare" \
   -H "authorization: Bearer $token_a" \
@@ -146,7 +150,7 @@ prepare_idempotency_id=$(node -e 'const j=JSON.parse(process.argv[1]); process.s
 [ -n "$prepare_idempotency_id" ]
 upload_idempotency_url=$(node -e 'const j=JSON.parse(process.argv[1]); process.stdout.write(j.uploadTargets?.[0]?.uploadUrl || "");' "$prepare_idempotency")
 if [ -n "$upload_idempotency_url" ]; then
-  curl -sS -X PUT "$upload_idempotency_url" --data-binary "reg-idempotency-$(date +%s)" >/dev/null
+  curl -sS -X PUT "$upload_idempotency_url" --data-binary "$content_idempotency" >/dev/null
 fi
 
 idempotency_key=$(new_uuid)

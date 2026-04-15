@@ -4,17 +4,20 @@
 - Base URL：`https://sync.example.com/api/v1`
 - 认证：`Authorization: Bearer <access_token>`
 - 内容类型：`application/json`
-- 幂等头：`Idempotency-Key: <uuid>`（对写接口必填）
+- 幂等键：`commit` 请求体中的 `idempotencyKey` 字段（UUID）。
 - 时间格式：`ISO 8601 UTC`
+- `contentHash` 必须使用 `sha256:<64位小写十六进制>` 格式，服务端会在 commit 前校验对象内容。
 
 ## 2. 认证与设备
 
-### 2.1 设备注册
-- `POST /auth/device/register`
+### 2.1 登录并注册/更新设备
+- `POST /auth/login`
 
 请求：
 ```json
 {
+  "email": "admin@example.com",
+  "password": "********",
   "deviceName": "Nova-MacBook",
   "platform": "macos",
   "pluginVersion": "0.1.0"
@@ -24,7 +27,7 @@
 响应：
 ```json
 {
-  "deviceId": "dev_123",
+  "deviceId": "550e8400-e29b-41d4-a716-446655440000",
   "accessToken": "xxx",
   "refreshToken": "xxx",
   "expiresIn": 3600
@@ -55,7 +58,7 @@
 响应：
 ```json
 {
-  "vaultId": "vault_123",
+  "vaultId": "550e8400-e29b-41d4-a716-446655440010",
   "name": "KnowledgeBase",
   "createdAt": "2026-02-18T12:00:00Z"
 }
@@ -69,8 +72,8 @@
 响应：
 ```json
 {
-  "checkpoint": "cp_0001024",
-  "serverTime": "2026-02-18T12:00:00Z"
+  "checkpoint": "cp_1024",
+  "serverTime": "2026-02-18T12:00:00.000Z"
 }
 ```
 
@@ -80,15 +83,14 @@
 请求：
 ```json
 {
-  "deviceId": "dev_123",
-  "baseCheckpoint": "cp_0001024",
+  "baseCheckpoint": 1024,
   "changes": [
     {
       "op": "update",
-      "fileId": "file_1",
+      "fileId": "550e8400-e29b-41d4-a716-446655440001",
       "path": "notes/a.md",
       "baseVersion": 3,
-      "contentHash": "sha256:abc"
+      "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     }
   ]
 }
@@ -97,10 +99,10 @@
 响应：
 ```json
 {
-  "prepareId": "prep_123",
+  "prepareId": "550e8400-e29b-41d4-a716-446655440002",
   "uploadTargets": [
     {
-      "contentHash": "sha256:abc",
+      "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       "uploadUrl": "https://obj.example.com/presigned-xxx"
     }
   ],
@@ -118,8 +120,7 @@
 请求：
 ```json
 {
-  "prepareId": "prep_123",
-  "deviceId": "dev_123",
+  "prepareId": "550e8400-e29b-41d4-a716-446655440002",
   "idempotencyKey": "4dbcbf6d-2048-4d8e-a4c6-fdb2f6cfc111"
 }
 ```
@@ -127,27 +128,27 @@
 响应：
 ```json
 {
-  "changesetId": "chg_456",
-  "newCheckpoint": "cp_0001025",
+  "changesetId": "550e8400-e29b-41d4-a716-446655440003",
+  "newCheckpoint": "cp_1025",
   "appliedChanges": 1
 }
 ```
 
 ### 4.4 拉取远端增量
-- `GET /vaults/{vaultId}/sync/pull?fromCheckpoint=cp_0001024&limit=200`
+- `GET /vaults/{vaultId}/sync/pull?fromCheckpoint=1024&limit=200`
 
 响应：
 ```json
 {
-  "fromCheckpoint": "cp_0001024",
-  "toCheckpoint": "cp_0001025",
+  "fromCheckpoint": "cp_1024",
+  "toCheckpoint": "cp_1025",
   "changes": [
     {
       "op": "update",
-      "fileId": "file_1",
+      "fileId": "550e8400-e29b-41d4-a716-446655440001",
       "path": "notes/a.md",
       "version": 4,
-      "contentHash": "sha256:abc"
+      "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     }
   ],
   "hasMore": false
@@ -160,7 +161,7 @@
 请求：
 ```json
 {
-  "contentHashes": ["sha256:abc", "sha256:def"]
+  "contentHashes": ["sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
 }
 ```
 
@@ -169,7 +170,7 @@
 {
   "items": [
     {
-      "contentHash": "sha256:abc",
+      "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       "downloadUrl": "https://obj.example.com/presigned-download-1"
     }
   ]

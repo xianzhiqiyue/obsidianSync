@@ -10,12 +10,16 @@ const vaultParamsSchema = z.object({
   vaultId: z.string().uuid()
 });
 
+const contentHashSchema = z
+  .string()
+  .regex(/^sha256:[a-f0-9]{64}$/, "contentHash must be sha256:<64 lowercase hex chars>");
+
 const syncChangeSchema = z.object({
   op: z.enum(["create", "update", "delete", "rename", "move"]),
   fileId: z.string().uuid().optional(),
   path: z.string().min(1).max(4096),
   baseVersion: z.number().int().nonnegative().optional(),
-  contentHash: z.string().min(1).optional()
+  contentHash: contentHashSchema.optional()
 });
 
 const prepareBodySchema = z.object({
@@ -34,7 +38,7 @@ const pullQuerySchema = z.object({
 });
 
 const downloadUrlsSchema = z.object({
-  contentHashes: z.array(z.string().min(1)).max(500)
+  contentHashes: z.array(contentHashSchema).max(500)
 });
 
 type SyncChangeInput = z.infer<typeof syncChangeSchema>;
@@ -243,6 +247,9 @@ async function resolveUploadTargets(
     }
 
     if (await objectStore.objectExists(hash)) {
+      if (!(await objectStore.verifyObjectContentHash(hash))) {
+        continue;
+      }
       await query("INSERT INTO object_blobs (content_hash) VALUES ($1) ON CONFLICT (content_hash) DO NOTHING", [
         hash
       ]);
@@ -287,6 +294,9 @@ async function ensureUploadedObjectsExist(contentHashes: string[], objectStore: 
     }
     if (!(await objectStore.objectExists(hash))) {
       throw new Error(`missing uploaded object ${hash}`);
+    }
+    if (!(await objectStore.verifyObjectContentHash(hash))) {
+      throw new Error(`uploaded object hash mismatch ${hash}`);
     }
   }
 }

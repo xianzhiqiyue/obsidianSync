@@ -7,10 +7,12 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run -ws build",
+    "build": "npm run --workspaces build",
     "dev:api": "npm run --workspace @obsidian-sync/sync-api dev",
     "dev:plugin": "npm run --workspace @obsidian-sync/plugin dev",
     "migrate": "npm run --workspace @obsidian-sync/sync-api migrate",
-    "lint": "npm run -ws lint --if-present"
+    "lint": "npm run typecheck",
+    "test": "npm run --workspaces test --if-present",
+    "typecheck": "npm run --workspaces typecheck --if-present"
   }
 }

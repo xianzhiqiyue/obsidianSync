@@ -111,7 +111,7 @@ export default class CustomSyncPlugin extends Plugin {
   private lastBlockedNoticeAtMs = 0;
   private lastFailureNoticeAtMs = 0;
 
-  async onload(): Promise<void> {
+  override async onload(): Promise<void> {
     const loaded = await this.loadPersistedData();
     this.settings = loaded.settings;
     this.authState = loaded.auth;
@@ -161,7 +161,7 @@ export default class CustomSyncPlugin extends Plugin {
     new Notice("自建同步插件已加载");
   }
 
-  onunload(): void {
+  override onunload(): void {
     if (this.syncTimer !== null) {
       window.clearInterval(this.syncTimer);
       this.syncTimer = null;
@@ -485,7 +485,7 @@ export default class CustomSyncPlugin extends Plugin {
   }
 
   private detectPlatform(): DevicePlatform {
-    if (this.app.isMobile) {
+    if (this.isMobileApp()) {
       return "android";
     }
 
@@ -1089,6 +1089,7 @@ export default class CustomSyncPlugin extends Plugin {
       TOKEN_INVALID: "登录凭证无效，请重新登录",
       TOKEN_EXPIRED: "登录凭证已过期，请重新登录",
       FORBIDDEN: "无权限执行该操作",
+      DEVICE_REVOKED: "设备已被撤销，请重新登录",
       VAULT_NOT_FOUND: "找不到指定的 Vault",
       CHECKPOINT_MISMATCH: "同步检查点不一致",
       VERSION_CONFLICT: "版本冲突",
@@ -1236,7 +1237,7 @@ export default class CustomSyncPlugin extends Plugin {
   }
 
   private setupForegroundResumeHooks(): void {
-    if (!this.app.isMobile) {
+    if (!this.isMobileApp()) {
       return;
     }
 
@@ -1276,6 +1277,10 @@ export default class CustomSyncPlugin extends Plugin {
       void this.runSyncOnce("interval");
     }, this.settings.syncIntervalMinutes * 60 * 1000);
   }
+
+  private isMobileApp(): boolean {
+    return Boolean((this.app as App & { isMobile?: boolean }).isMobile);
+  }
 }
 
 class SyncSettingTab extends PluginSettingTab {
@@ -1286,7 +1291,7 @@ class SyncSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
-  display(): void {
+  override display(): void {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "自建同步设置" });

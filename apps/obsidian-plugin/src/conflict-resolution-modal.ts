@@ -37,7 +37,7 @@ export class ConflictResolutionModal extends Modal {
     this.selections = Object.fromEntries(conflicts.map((item) => [item.id, item.recommendedAction]));
   }
 
-  onOpen(): void {
+  override onOpen(): void {
     const { contentEl, titleEl } = this;
     titleEl.setText("处理同步冲突");
     contentEl.empty();
@@ -109,7 +109,7 @@ export class ConflictResolutionModal extends Modal {
       );
   }
 
-  onClose(): void {
+  override onClose(): void {
     this.contentEl.empty();
     if (!this.resolved) {
       this.resolved = true;
@@ -163,7 +163,7 @@ class ConflictAcknowledgeModal extends Modal {
     super(app);
   }
 
-  onOpen(): void {
+  override onOpen(): void {
     const { contentEl, titleEl } = this;
     titleEl.setText("同步冲突待处理");
     contentEl.empty();
@@ -190,7 +190,7 @@ class ConflictAcknowledgeModal extends Modal {
     );
   }
 
-  onClose(): void {
+  override onClose(): void {
     this.contentEl.empty();
     this.done();
   }

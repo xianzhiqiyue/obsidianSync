@@ -55,7 +55,8 @@ mkdir -p "$RUN_DIR"
 curl -fsS "$BASE_URL/health" >/dev/null || fail "sync-api health check failed: $BASE_URL/health"
 
 vault_name="DrillVault-$RUN_TAG"
-content_hash="$(node -e 'const { randomUUID } = require("crypto"); process.stdout.write(`sha256:drill-${randomUUID()}`);')"
+content="drill-content-$RUN_TAG"
+content_hash="$(printf '%s' "$content" | sha256sum | awk '{print "sha256:"$1}')"
 target_path="drill/$RUN_TAG.md"
 
 login=$(curl -fsS -X POST "$BASE_URL/auth/login" \
@@ -84,7 +85,7 @@ prepare_id=$(node -e 'const j=JSON.parse(process.argv[1]); process.stdout.write(
 upload_url=$(node -e 'const j=JSON.parse(process.argv[1]); process.stdout.write(j.uploadTargets?.[0]?.uploadUrl || "");' "$prepare")
 
 if [ -n "$upload_url" ]; then
-  curl -fsS -X PUT "$upload_url" --data-binary "drill-content-$RUN_TAG" >/dev/null
+  curl -fsS -X PUT "$upload_url" --data-binary "$content" >/dev/null
 fi
 
 commit=$(curl -fsS -X POST "$BASE_URL/vaults/$vault_id/sync/commit" \

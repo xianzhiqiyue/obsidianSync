@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import test, { after } from "node:test";
 import jwt from "@fastify/jwt";
 import Fastify, { type FastifyInstance } from "fastify";
@@ -32,12 +32,17 @@ interface SyncErrorResponse {
   message: string;
 }
 
+function testContentHash(label: string = randomUUID()): string {
+  return `sha256:${createHash("sha256").update(label).digest("hex")}`;
+}
+
 interface TestContext {
   app: FastifyInstance;
   userId: string;
   deviceId: string;
   vaultId: string;
   accessToken: string;
+  refreshToken: string;
 }
 
 class FakeObjectStore extends ObjectStore {
@@ -57,6 +62,10 @@ class FakeObjectStore extends ObjectStore {
 
   override async createDownloadUrl(contentHash: string): Promise<string> {
     return `https://download.example.local/${encodeURIComponent(contentHash)}`;
+  }
+
+  override async verifyObjectContentHash(contentHash: string): Promise<boolean> {
+    return this.existingHashes.has(contentHash);
   }
 }
 
@@ -90,13 +99,19 @@ async function createTestContext(existingHashes: Set<string>): Promise<TestConte
     deviceId,
     type: "access"
   });
+  const refreshToken = app.jwt.sign({
+    sub: userId,
+    deviceId,
+    type: "refresh"
+  });
 
   return {
     app,
     userId,
     deviceId,
     vaultId,
-    accessToken
+    accessToken,
+    refreshToken
   };
 }
 
@@ -116,7 +131,7 @@ async function cleanupObjectHashes(contentHashes: string[]): Promise<void> {
 }
 
 test("sync commit should be idempotent for same idempotency key", async () => {
-  const contentHash = `sha256:test-idempotent-${randomUUID()}`;
+  const contentHash = testContentHash("idempotent");
   const existingHashes = new Set([contentHash]);
   const context = await createTestContext(existingHashes);
   try {
@@ -181,9 +196,39 @@ test("sync commit should be idempotent for same idempotency key", async () => {
   }
 });
 
+test("sync routes should reject refresh tokens and revoked devices", async () => {
+  const context = await createTestContext(new Set());
+  try {
+    const refreshTokenRes = await context.app.inject({
+      method: "GET",
+      url: `/api/v1/vaults/${context.vaultId}/sync/state`,
+      headers: {
+        authorization: `Bearer ${context.refreshToken}`
+      }
+    });
+    assert.equal(refreshTokenRes.statusCode, 401);
+    assert.equal((refreshTokenRes.json() as SyncErrorResponse).code, "UNAUTHORIZED");
+
+    await query("UPDATE devices SET status = 'revoked', revoked_at = NOW() WHERE id = $1", [
+      context.deviceId
+    ]);
+    const revokedDeviceRes = await context.app.inject({
+      method: "GET",
+      url: `/api/v1/vaults/${context.vaultId}/sync/state`,
+      headers: {
+        authorization: `Bearer ${context.accessToken}`
+      }
+    });
+    assert.equal(revokedDeviceRes.statusCode, 403);
+    assert.equal((revokedDeviceRes.json() as SyncErrorResponse).code, "DEVICE_REVOKED");
+  } finally {
+    await destroyTestContext(context);
+  }
+});
+
 test("sync commit should reject conflicted prepare", async () => {
-  const contentHashCreate = `sha256:test-conflict-create-${randomUUID()}`;
-  const contentHashUpdate = `sha256:test-conflict-update-${randomUUID()}`;
+  const contentHashCreate = testContentHash("conflict-create");
+  const contentHashUpdate = testContentHash("conflict-update");
   const existingHashes = new Set([contentHashCreate, contentHashUpdate]);
   const context = await createTestContext(existingHashes);
   try {
@@ -277,8 +322,8 @@ test("sync commit should reject conflicted prepare", async () => {
 });
 
 test("sync prepare should return rich metadata for deleted and version conflicts", async () => {
-  const contentHashCreate = `sha256:test-rich-create-${randomUUID()}`;
-  const contentHashUpdate = `sha256:test-rich-update-${randomUUID()}`;
+  const contentHashCreate = testContentHash("rich-create");
+  const contentHashUpdate = testContentHash("rich-update");
   const existingHashes = new Set([contentHashCreate, contentHashUpdate]);
   const context = await createTestContext(existingHashes);
   try {
@@ -344,8 +389,8 @@ test("sync prepare should return rich metadata for deleted and version conflicts
 });
 
 test("sync prepare should return rich metadata for target path conflicts", async () => {
-  const hashA = `sha256:test-path-a-${randomUUID()}`;
-  const hashB = `sha256:test-path-b-${randomUUID()}`;
+  const hashA = testContentHash("path-a");
+  const hashB = testContentHash("path-b");
   const existingHashes = new Set([hashA, hashB]);
   const context = await createTestContext(existingHashes);
   try {
@@ -400,8 +445,8 @@ test("sync prepare should return rich metadata for target path conflicts", async
 });
 
 test("sync prepare should treat identical stale update as no-op instead of conflict", async () => {
-  const originalHash = `sha256:test-noop-original-${randomUUID()}`;
-  const updateHash = `sha256:test-noop-update-${randomUUID()}`;
+  const originalHash = testContentHash("noop-original");
+  const updateHash = testContentHash("noop-update");
   const existingHashes = new Set([originalHash, updateHash]);
   const context = await createTestContext(existingHashes);
   try {
@@ -492,8 +537,8 @@ test("sync prepare should treat identical stale update as no-op instead of confl
 });
 
 test("sync commit should serialize concurrent commits on same vault", async () => {
-  const contentHashA = `sha256:test-concurrent-a-${randomUUID()}`;
-  const contentHashB = `sha256:test-concurrent-b-${randomUUID()}`;
+  const contentHashA = testContentHash(`concurrent-a-${randomUUID()}`);
+  const contentHashB = testContentHash(`concurrent-b-${randomUUID()}`);
   const existingHashes = new Set([contentHashA, contentHashB]);
   const context = await createTestContext(existingHashes);
   try {
@@ -587,7 +632,7 @@ test("sync commit should serialize concurrent commits on same vault", async () =
 });
 
 test("sync commit should fail when uploaded object is missing", async () => {
-  const missingHash = `sha256:test-missing-${randomUUID()}`;
+  const missingHash = testContentHash("missing");
   const context = await createTestContext(new Set());
   try {
     const prepareRes = await context.app.inject({

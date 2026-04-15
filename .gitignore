@@ -10,3 +10,8 @@ coverage
 reports/*
 releases/*
 .omx/
+!.env.example
+!.env.*.example
+!apps/**/.env.example
+!apps/**/.env.test.example
+!infra/.env.prod.example

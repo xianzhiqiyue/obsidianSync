@@ -6,6 +6,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { createHash } from "node:crypto";
 import type { AppConfig } from "./config.js";
 
 export class ObjectStore {
@@ -73,7 +74,49 @@ export class ObjectStore {
     await this.client.send(new HeadBucketCommand({ Bucket: this.bucket }));
   }
 
+  async verifyObjectContentHash(contentHash: string): Promise<boolean> {
+    const response = await this.client.send(
+      new GetObjectCommand({
+        Bucket: this.bucket,
+        Key: this.toObjectKey(contentHash)
+      })
+    );
+    const bytes = await readResponseBody(response.Body);
+    const actualHash = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+    return actualHash === contentHash;
+  }
+
   private toObjectKey(contentHash: string): string {
     return contentHash.replace(":", "/");
   }
+}
+
+async function readResponseBody(body: unknown): Promise<Uint8Array> {
+  const maybeBody = body as
+    | {
+        transformToByteArray?: () => Promise<Uint8Array>;
+        transformToString?: () => Promise<string>;
+      }
+    | undefined;
+  if (!maybeBody) {
+    throw new Error("object response body is empty");
+  }
+  if (typeof maybeBody.transformToByteArray === "function") {
+    return maybeBody.transformToByteArray();
+  }
+  if (typeof maybeBody.transformToString === "function") {
+    return Buffer.from(await maybeBody.transformToString());
+  }
+  if (isAsyncIterableUint8Array(body)) {
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of body) {
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
+  }
+  throw new Error("unsupported object response body");
+}
+
+function isAsyncIterableUint8Array(value: unknown): value is AsyncIterable<Uint8Array> {
+  return Boolean(value && typeof (value as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === "function");
 }
