@@ -1,0 +1,5 @@
+ALTER TABLE file_versions
+  ADD COLUMN IF NOT EXISTS ctime_ms BIGINT;
+
+ALTER TABLE change_events
+  ADD COLUMN IF NOT EXISTS ctime_ms BIGINT;

@@ -29,6 +29,19 @@ test("recommended action prefers local for file-not-found and remote for nested 
   assert.match(getConflictRecommendationReason("use_local", fileMissing, "notes/a.md"), /远端文件记录已不存在/);
 });
 
+
+test("recommended action treats official conflict copies as remote", () => {
+  const conflict: SyncConflict = {
+    index: 0,
+    code: "VERSION_CONFLICT",
+    path: "notes/a (Conflicted copy MacBook 202604141545).md",
+    message: "version conflict"
+  };
+
+  assert.equal(getRecommendedConflictAction(conflict, conflict.path), "use_remote");
+  assert.match(getConflictRecommendationReason("use_remote", conflict, conflict.path), /冲突副本/);
+});
+
 test("buildConflictResolutionCandidate includes preview and stable id", () => {
   const conflict: SyncConflict = {
     index: 0,
@@ -76,12 +89,16 @@ test("buildRemoteSummary renders available remote metadata", () => {
     remotePath: "notes/b.md",
     headVersion: 2,
     remoteDeleted: false,
-    existingFileId: "22222222-2222-2222-2222-222222222222"
+    existingFileId: "22222222-2222-2222-2222-222222222222",
+    remoteContentHash: "sha256:remote",
+    remoteMtimeMs: 1776170000000
   });
 
   assert.match(summary ?? "", /原因标记：target_path_exists/);
   assert.match(summary ?? "", /远端路径：notes\/b\.md/);
   assert.match(summary ?? "", /占用文件 ID：22222222-2222-2222-2222-222222222222/);
+  assert.match(summary ?? "", /远端内容哈希：sha256:remote/);
+  assert.match(summary ?? "", /远端修改时间：/);
 });
 
 test("createTextPreview normalizes whitespace and truncates long text", () => {

@@ -1,4 +1,5 @@
 import type { SyncChangeRequest, SyncConflict } from "./api-client";
+import { isConflictCopyPath } from "./conflict-copy";
 import type { ConflictResolutionAction, ConflictResolutionCandidate } from "./conflict-resolution-modal";
 
 export interface LocalConflictFileInfo {
@@ -12,7 +13,7 @@ export function buildConflictResolutionId(conflict: SyncConflict, path: string):
 }
 
 export function getRecommendedConflictAction(conflict: SyncConflict, path: string): ConflictResolutionAction {
-  if (path.includes(".conflict-")) {
+  if (isConflictCopyPath(path)) {
     return "use_remote";
   }
   if (conflict.code === "FILE_NOT_FOUND") {
@@ -27,8 +28,8 @@ export function getConflictRecommendationReason(
   path: string
 ): string {
   if (action === "use_remote") {
-    if (path.includes(".conflict-")) {
-      return "当前文件看起来是历史冲突遗留文件，继续保留本地通常只会留下更多无效垃圾。";
+    if (isConflictCopyPath(path)) {
+      return "当前文件看起来是冲突副本，继续保留本地通常只会留下更多无效垃圾。";
     }
     return "优先接受远端状态，避免继续放大当前冲突。";
   }
@@ -81,6 +82,12 @@ export function buildRemoteSummary(conflict: SyncConflict): string | null {
   }
   if (conflict.existingFileId) {
     parts.push(`占用文件 ID：${conflict.existingFileId}`);
+  }
+  if (conflict.remoteContentHash) {
+    parts.push(`远端内容哈希：${conflict.remoteContentHash}`);
+  }
+  if (typeof conflict.remoteMtimeMs === "number") {
+    parts.push(`远端修改时间：${new Date(conflict.remoteMtimeMs).toLocaleString()}`);
   }
   return parts.length > 0 ? parts.join("\n") : null;
 }

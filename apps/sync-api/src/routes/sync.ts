@@ -5,6 +5,7 @@ import { appConfig } from "../config.js";
 import { query, withTransaction } from "../db.js";
 import { metricsRegistry } from "../metrics.js";
 import type { ObjectStore } from "../object-store.js";
+import { publishSyncCheckpoint, subscribeToSyncEvents } from "../sync-events.js";
 
 const vaultParamsSchema = z.object({
   vaultId: z.string().uuid()
@@ -19,7 +20,9 @@ const syncChangeSchema = z.object({
   fileId: z.string().uuid().optional(),
   path: z.string().min(1).max(4096),
   baseVersion: z.number().int().nonnegative().optional(),
-  contentHash: contentHashSchema.optional()
+  contentHash: contentHashSchema.optional(),
+  mtimeMs: z.number().int().nonnegative().optional(),
+  ctimeMs: z.number().int().nonnegative().optional()
 });
 
 const prepareBodySchema = z.object({
@@ -39,6 +42,12 @@ const pullQuerySchema = z.object({
 
 const downloadUrlsSchema = z.object({
   contentHashes: z.array(contentHashSchema).max(500)
+});
+
+const fileVersionDownloadParamsSchema = z.object({
+  vaultId: z.string().uuid(),
+  fileId: z.string().uuid(),
+  version: z.coerce.number().int().positive()
 });
 
 type SyncChangeInput = z.infer<typeof syncChangeSchema>;
@@ -65,6 +74,8 @@ interface ChangeEventRow {
   path: string;
   version: number;
   content_hash: string;
+  mtime_ms: string | null;
+  ctime_ms: string | null;
 }
 
 interface SyncPrepareRow {
@@ -87,6 +98,9 @@ interface ConflictItem {
   remotePath?: string;
   remoteDeleted?: boolean;
   existingFileId?: string;
+  remoteContentHash?: string;
+  remoteMtimeMs?: number;
+  remoteCtimeMs?: number;
 }
 
 interface UploadTarget {
@@ -317,6 +331,29 @@ async function fetchLatestContentHash(client: { query: typeof query }, fileId: s
   return version.content_hash;
 }
 
+async function fetchLatestVersionMetadata(
+  client: { query: typeof query },
+  fileId: string
+): Promise<{ contentHash: string; mtimeMs?: number; ctimeMs?: number }> {
+  const row = await client.query<{ content_hash: string; mtime_ms: string | null; ctime_ms: string | null }>(
+    `SELECT content_hash, mtime_ms, ctime_ms
+     FROM file_versions
+     WHERE file_id = $1
+     ORDER BY version DESC
+     LIMIT 1`,
+    [fileId]
+  );
+  const version = row.rows[0];
+  if (!version) {
+    throw new Error("missing latest version metadata");
+  }
+  return {
+    contentHash: version.content_hash,
+    mtimeMs: version.mtime_ms === null ? undefined : Number(version.mtime_ms),
+    ctimeMs: version.ctime_ms === null ? undefined : Number(version.ctime_ms)
+  };
+}
+
 async function isNoopUpdate(vaultId: string, change: SyncChangeInput): Promise<boolean> {
   if (change.op !== "update" || !change.fileId || !change.contentHash) {
     return false;
@@ -348,6 +385,21 @@ function parseVaultParams(
 
 export default function syncRoutes(objectStore: ObjectStore) {
   return async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
+    app.get("/vaults/:vaultId/sync/stream", async (request, reply) => {
+      const auth = await requireAuth(request, reply);
+      if (!auth) return;
+
+      const params = parseVaultParams(request, reply);
+      if (!params) return;
+      const { vaultId } = params;
+      if (!(await assertVaultOwnership(vaultId, auth.userId))) {
+        return reply.code(404).send({ code: "VAULT_NOT_FOUND", message: "vault not found" });
+      }
+
+      const checkpoint = await ensureCheckpointRow(vaultId);
+      subscribeToSyncEvents(reply, vaultId, auth.deviceId, `cp_${checkpoint}`);
+    });
+
     app.get("/vaults/:vaultId/sync/state", async (request, reply) => {
       const auth = await requireAuth(request, reply);
       if (!auth) return;
@@ -405,6 +457,7 @@ export default function syncRoutes(objectStore: ObjectStore) {
         if (change.op === "create") {
           const occupiedEntry = await getActiveFileEntryByPath(vaultId, change.path);
           if (occupiedEntry) {
+            const remoteMetadata = await fetchLatestVersionMetadata({ query }, occupiedEntry.id);
             conflicts.push({
               index,
               code: "PATH_CONFLICT",
@@ -414,7 +467,10 @@ export default function syncRoutes(objectStore: ObjectStore) {
               remotePath: occupiedEntry.current_path,
               headVersion: occupiedEntry.head_version,
               existingFileId: occupiedEntry.id,
-              remoteDeleted: false
+              remoteDeleted: false,
+              remoteContentHash: remoteMetadata.contentHash,
+              remoteMtimeMs: remoteMetadata.mtimeMs,
+              remoteCtimeMs: remoteMetadata.ctimeMs
             });
             continue;
           }
@@ -424,6 +480,7 @@ export default function syncRoutes(objectStore: ObjectStore) {
 
         const fileEntry = await getFileEntry(vaultId, change.fileId!);
         if (!fileEntry || fileEntry.deleted_at) {
+          const remoteMetadata = fileEntry ? await fetchLatestVersionMetadata({ query }, fileEntry.id) : null;
           conflicts.push({
             index,
             code: "FILE_NOT_FOUND",
@@ -433,7 +490,10 @@ export default function syncRoutes(objectStore: ObjectStore) {
             reason: fileEntry?.deleted_at ? "deleted_on_server" : "unknown_file_id",
             remotePath: fileEntry?.current_path,
             headVersion: fileEntry?.head_version,
-            remoteDeleted: Boolean(fileEntry?.deleted_at)
+            remoteDeleted: Boolean(fileEntry?.deleted_at),
+            remoteContentHash: remoteMetadata?.contentHash,
+            remoteMtimeMs: remoteMetadata?.mtimeMs,
+            remoteCtimeMs: remoteMetadata?.ctimeMs
           });
           continue;
         }
@@ -443,6 +503,7 @@ export default function syncRoutes(objectStore: ObjectStore) {
         }
 
         if (fileEntry.head_version !== change.baseVersion) {
+          const remoteMetadata = await fetchLatestVersionMetadata({ query }, fileEntry.id);
           conflicts.push({
             index,
             code: "VERSION_CONFLICT",
@@ -452,7 +513,10 @@ export default function syncRoutes(objectStore: ObjectStore) {
             reason: "base_version_mismatch",
             headVersion: fileEntry.head_version,
             remotePath: fileEntry.current_path,
-            remoteDeleted: false
+            remoteDeleted: false,
+            remoteContentHash: remoteMetadata.contentHash,
+            remoteMtimeMs: remoteMetadata.mtimeMs,
+            remoteCtimeMs: remoteMetadata.ctimeMs
           });
           continue;
         }
@@ -462,6 +526,7 @@ export default function syncRoutes(objectStore: ObjectStore) {
             ? await getActiveFileEntryByPath(vaultId, change.path, fileEntry.id)
             : null;
         if (occupiedTarget) {
+          const remoteMetadata = await fetchLatestVersionMetadata({ query }, occupiedTarget.id);
           conflicts.push({
             index,
             code: "PATH_CONFLICT",
@@ -472,7 +537,10 @@ export default function syncRoutes(objectStore: ObjectStore) {
             remotePath: occupiedTarget.current_path,
             headVersion: occupiedTarget.head_version,
             existingFileId: occupiedTarget.id,
-            remoteDeleted: false
+            remoteDeleted: false,
+            remoteContentHash: remoteMetadata.contentHash,
+            remoteMtimeMs: remoteMetadata.mtimeMs,
+            remoteCtimeMs: remoteMetadata.ctimeMs
           });
           continue;
         }
@@ -660,14 +728,14 @@ export default function syncRoutes(objectStore: ObjectStore) {
               }
 
               await client.query(
-                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id)
-                 VALUES ($1, 1, $2, $3)`,
-                [fileId, change.contentHash, auth.deviceId]
+                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms)
+                 VALUES ($1, 1, $2, $3, $4, $5)`,
+                [fileId, change.contentHash, auth.deviceId, change.mtimeMs, change.ctimeMs]
               );
               await client.query(
-                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-                [vaultId, changesetId, nextCheckpoint, "create", fileId, change.path, 1, change.contentHash]
+                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+                [vaultId, changesetId, nextCheckpoint, "create", fileId, change.path, 1, change.contentHash, change.mtimeMs, change.ctimeMs]
               );
               continue;
             }
@@ -708,14 +776,14 @@ export default function syncRoutes(objectStore: ObjectStore) {
                 [nextVersion, change.path, file.id]
               );
               await client.query(
-                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id)
-                 VALUES ($1, $2, $3, $4)`,
-                [file.id, nextVersion, change.contentHash, auth.deviceId]
+                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6)`,
+                [file.id, nextVersion, change.contentHash, auth.deviceId, change.mtimeMs, change.ctimeMs]
               );
               await client.query(
-                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-                [vaultId, changesetId, nextCheckpoint, "update", file.id, change.path, nextVersion, change.contentHash]
+                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+                [vaultId, changesetId, nextCheckpoint, "update", file.id, change.path, nextVersion, change.contentHash, change.mtimeMs, change.ctimeMs]
               );
               continue;
             }
@@ -728,9 +796,9 @@ export default function syncRoutes(objectStore: ObjectStore) {
                 [nextVersion, file.id]
               );
               await client.query(
-                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id)
-                 VALUES ($1, $2, $3, $4)`,
-                [file.id, nextVersion, currentHash, auth.deviceId]
+                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6)`,
+                [file.id, nextVersion, currentHash, auth.deviceId, change.mtimeMs, change.ctimeMs]
               );
               await client.query(
                 `INSERT INTO tombstones (vault_id, file_id, deleted_at, expire_at)
@@ -738,9 +806,9 @@ export default function syncRoutes(objectStore: ObjectStore) {
                 [vaultId, file.id, appConfig.tombstoneRetentionDays]
               );
               await client.query(
-                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-                [vaultId, changesetId, nextCheckpoint, "delete", file.id, file.current_path, nextVersion, currentHash]
+                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+                [vaultId, changesetId, nextCheckpoint, "delete", file.id, file.current_path, nextVersion, currentHash, change.mtimeMs, change.ctimeMs]
               );
               continue;
             }
@@ -767,14 +835,14 @@ export default function syncRoutes(objectStore: ObjectStore) {
                 [nextVersion, change.path, file.id]
               );
               await client.query(
-                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id)
-                 VALUES ($1, $2, $3, $4)`,
-                [file.id, nextVersion, currentHash, auth.deviceId]
+                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6)`,
+                [file.id, nextVersion, currentHash, auth.deviceId, change.mtimeMs, change.ctimeMs]
               );
               await client.query(
-                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-                [vaultId, changesetId, nextCheckpoint, change.op, file.id, change.path, nextVersion, currentHash]
+                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+                [vaultId, changesetId, nextCheckpoint, change.op, file.id, change.path, nextVersion, currentHash, change.mtimeMs, change.ctimeMs]
               );
               continue;
             }
@@ -803,6 +871,15 @@ export default function syncRoutes(objectStore: ObjectStore) {
 
         metricsRegistry.incCounter("sync_api_sync_commit_total", { result: "success" });
         metricsRegistry.incCounter("sync_api_sync_commit_applied_changes_total", {}, commitResponse.appliedChanges);
+        if (commitResponse.appliedChanges > 0) {
+          publishSyncCheckpoint({
+            vaultId,
+            checkpoint: commitResponse.newCheckpoint,
+            changesetId: commitResponse.changesetId,
+            authorDeviceId: auth.deviceId,
+            ts: new Date().toISOString()
+          });
+        }
         return reply.send(commitResponse);
       } catch (error) {
         request.log.error({ err: error }, "sync commit failed");
@@ -846,7 +923,7 @@ export default function syncRoutes(objectStore: ObjectStore) {
 
       const limit = parsed.data.limit ?? 200;
       const result = await query<ChangeEventRow>(
-        `SELECT checkpoint, op, file_id, path, version, content_hash
+        `SELECT checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms
          FROM change_events
          WHERE vault_id = $1
            AND checkpoint > $2
@@ -870,9 +947,48 @@ export default function syncRoutes(objectStore: ObjectStore) {
           fileId: row.file_id,
           path: row.path,
           version: row.version,
-          contentHash: row.content_hash
+          contentHash: row.content_hash,
+          mtimeMs: row.mtime_ms === null ? undefined : Number(row.mtime_ms),
+          ctimeMs: row.ctime_ms === null ? undefined : Number(row.ctime_ms)
         })),
         hasMore
+      });
+    });
+
+
+    app.post("/vaults/:vaultId/files/:fileId/versions/:version/download-url", async (request, reply) => {
+      const auth = await requireAuth(request, reply);
+      if (!auth) return;
+
+      const parsedParams = fileVersionDownloadParamsSchema.safeParse(request.params);
+      if (!parsedParams.success) {
+        return reply.code(400).send({ code: "INVALID_PARAMS", message: parsedParams.error.flatten() });
+      }
+      const { vaultId, fileId, version } = parsedParams.data;
+      if (!(await assertVaultOwnership(vaultId, auth.userId))) {
+        return reply.code(404).send({ code: "VAULT_NOT_FOUND", message: "vault not found" });
+      }
+
+      const result = await query<{ content_hash: string }>(
+        `SELECT fv.content_hash
+         FROM file_versions fv
+         JOIN file_entries fe ON fe.id = fv.file_id
+         WHERE fe.vault_id = $1
+           AND fv.file_id = $2
+           AND fv.version = $3
+         LIMIT 1`,
+        [vaultId, fileId, version]
+      );
+      const row = result.rows[0];
+      if (!row) {
+        return reply.code(404).send({ code: "FILE_VERSION_NOT_FOUND", message: "file version not found" });
+      }
+
+      return reply.send({
+        fileId,
+        version,
+        contentHash: row.content_hash,
+        downloadUrl: await objectStore.createDownloadUrl(row.content_hash)
       });
     });
 

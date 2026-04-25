@@ -5,6 +5,8 @@ export interface QueuedChange {
   fileId?: string;
   baseVersion?: number;
   contentHash?: string;
+  mtimeMs?: number;
+  ctimeMs?: number;
   attempts: number;
   ts: number;
 }
@@ -14,6 +16,8 @@ export interface IndexedFileState {
   path: string;
   version: number;
   contentHash: string;
+  mtimeMs?: number;
+  ctimeMs?: number;
 }
 
 export interface SyncFailureState {

@@ -30,6 +30,8 @@ export interface SyncChangeRequest {
   path: string;
   baseVersion?: number;
   contentHash?: string;
+  mtimeMs?: number;
+  ctimeMs?: number;
 }
 
 export interface SyncConflict {
@@ -43,6 +45,9 @@ export interface SyncConflict {
   remotePath?: string;
   remoteDeleted?: boolean;
   existingFileId?: string;
+  remoteContentHash?: string;
+  remoteMtimeMs?: number;
+  remoteCtimeMs?: number;
 }
 
 export interface UploadTarget {
@@ -68,6 +73,8 @@ export interface SyncPullChange {
   path: string;
   version: number;
   contentHash: string;
+  mtimeMs?: number;
+  ctimeMs?: number;
 }
 
 export interface SyncPullResponse {
@@ -84,6 +91,13 @@ export interface DownloadUrlItem {
 
 export interface DownloadUrlsResponse {
   items: DownloadUrlItem[];
+}
+
+export interface FileVersionDownloadUrlResponse {
+  fileId: string;
+  version: number;
+  contentHash: string;
+  downloadUrl: string;
 }
 
 interface ApiErrorPayload {
@@ -182,6 +196,26 @@ export class SyncApiClient {
       `/vaults/${vaultId}/sync/pull?fromCheckpoint=${fromCheckpoint}&limit=${limit}`,
       {
         method: "GET",
+        headers: {
+          Authorization: `Bearer ${accessToken}`
+        },
+        signal
+      },
+      signal
+    );
+  }
+
+  async getFileVersionDownloadUrl(
+    accessToken: string,
+    vaultId: string,
+    fileId: string,
+    version: number,
+    signal?: AbortSignal
+  ): Promise<FileVersionDownloadUrlResponse> {
+    return this.request<FileVersionDownloadUrlResponse>(
+      `/vaults/${vaultId}/files/${fileId}/versions/${version}/download-url`,
+      {
+        method: "POST",
         headers: {
           Authorization: `Bearer ${accessToken}`
         },
