@@ -1,1 +1,71 @@
-/* placeholder for plugin styles */
+.custom-sync-settings pre,
+.custom-sync-conflict-item pre {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.custom-sync-settings .setting-item-control,
+.custom-sync-conflict-actions .setting-item-control {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.custom-sync-settings .setting-item-control input[type="text"],
+.custom-sync-settings .setting-item-control input[type="password"],
+.custom-sync-settings .setting-item-control select,
+.custom-sync-conflict-item .setting-item-control select {
+  max-width: 100%;
+}
+
+.custom-sync-action-setting .setting-item-control button,
+.custom-sync-conflict-actions .setting-item-control button {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.25;
+  min-height: 32px;
+  height: auto;
+}
+
+@media (max-width: 640px) {
+  .custom-sync-settings .setting-item,
+  .custom-sync-conflict-item .setting-item,
+  .custom-sync-conflict-actions .setting-item {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .custom-sync-settings .setting-item-info,
+  .custom-sync-settings .setting-item-control,
+  .custom-sync-conflict-item .setting-item-info,
+  .custom-sync-conflict-item .setting-item-control,
+  .custom-sync-conflict-actions .setting-item-info,
+  .custom-sync-conflict-actions .setting-item-control {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .custom-sync-settings .setting-item-control,
+  .custom-sync-conflict-actions .setting-item-control {
+    justify-content: stretch;
+  }
+
+  .custom-sync-settings .setting-item-control > *,
+  .custom-sync-conflict-actions .setting-item-control > *,
+  .custom-sync-conflict-item .setting-item-control > * {
+    flex: 1 1 100%;
+  }
+
+  .custom-sync-settings .setting-item-control input[type="text"],
+  .custom-sync-settings .setting-item-control input[type="password"],
+  .custom-sync-settings .setting-item-control select,
+  .custom-sync-conflict-item .setting-item-control select,
+  .custom-sync-action-setting .setting-item-control button,
+  .custom-sync-conflict-actions .setting-item-control button {
+    width: 100%;
+  }
+}

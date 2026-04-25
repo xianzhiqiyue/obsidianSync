@@ -1757,6 +1757,7 @@ class SyncSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    containerEl.addClass("custom-sync-settings");
     containerEl.createEl("h2", { text: "自建同步设置" });
 
     new Setting(containerEl)
@@ -1948,6 +1949,7 @@ class SyncSettingTab extends PluginSettingTab {
     refreshPendingConflicts();
 
     new Setting(statusContainer)
+      .setClass("custom-sync-action-setting")
       .setName("状态操作")
       .setDesc("刷新当前状态或触发一次同步。")
       .addButton((button) =>
@@ -1991,6 +1993,7 @@ class SyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setClass("custom-sync-action-setting")
       .setName("快捷操作")
       .setDesc("常用同步操作入口。")
       .addButton((button) =>
