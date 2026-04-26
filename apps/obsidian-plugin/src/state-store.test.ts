@@ -13,6 +13,7 @@ function createStore(initial?: Partial<LocalSyncState>) {
     checkpoint: initial?.checkpoint ?? DEFAULT_LOCAL_SYNC_STATE.checkpoint,
     queue: initial?.queue ?? [],
     fileIndexByPath: initial?.fileIndexByPath ?? {},
+    localDeleteMarkers: initial?.localDeleteMarkers ?? {},
     failure: initial?.failure ?? { ...DEFAULT_LOCAL_SYNC_STATE.failure },
     pendingConflicts: initial?.pendingConflicts ?? { ...DEFAULT_LOCAL_SYNC_STATE.pendingConflicts }
   };
@@ -86,6 +87,7 @@ test("state store constructor keeps backward compatibility when pending conflict
       checkpoint: null,
       queue: [],
       fileIndexByPath: {},
+      localDeleteMarkers: {},
       failure: { ...DEFAULT_LOCAL_SYNC_STATE.failure }
     },
     async () => {}
@@ -94,4 +96,25 @@ test("state store constructor keeps backward compatibility when pending conflict
   const pending = legacyStore.getPendingConflicts();
   assert.equal(pending.items.length, 0);
   assert.equal(pending.deferredAt, null);
+});
+
+test("local delete markers can be stored and cleared", async () => {
+  const store = createStore();
+  await store.markLocalDelete({
+    fileId: "11111111-1111-1111-1111-111111111111",
+    path: "notes/a.md",
+    baseVersion: 3,
+    ts: 123
+  });
+
+  const markers = store.getLocalDeleteMarkers();
+  assert.deepEqual(markers["notes/a.md"], {
+    fileId: "11111111-1111-1111-1111-111111111111",
+    path: "notes/a.md",
+    baseVersion: 3,
+    ts: 123
+  });
+
+  await store.clearLocalDeleteMarkers();
+  assert.deepEqual(store.getLocalDeleteMarkers(), {});
 });

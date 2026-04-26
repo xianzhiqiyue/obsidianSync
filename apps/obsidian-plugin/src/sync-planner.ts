@@ -1,6 +1,6 @@
 import type { SyncChangeRequest } from "./api-client";
 import { isConflictCopyPath as isConflictCopyPathFromConflictCopy } from "./conflict-copy";
-import type { IndexedFileState, QueuedChange } from "./state-store";
+import type { IndexedFileState, LocalDeleteMarker, QueuedChange } from "./state-store";
 
 export interface LocalFileSnapshot {
   path: string;
@@ -21,16 +21,19 @@ export interface LocalSyncPlan {
 interface PlannerOptions {
   now?: () => number;
   newId?: () => string;
+  deleteMarkers?: Record<string, LocalDeleteMarker>;
 }
 
 interface PlannerRuntimeOptions {
   now: () => number;
   newId: () => string;
+  deleteMarkers: Record<string, LocalDeleteMarker>;
 }
 
 const DEFAULT_OPTIONS: PlannerRuntimeOptions = {
   now: () => Date.now(),
-  newId: () => crypto.randomUUID()
+  newId: () => crypto.randomUUID(),
+  deleteMarkers: {}
 };
 
 export function isConflictCopyPath(path: string): boolean {
@@ -184,6 +187,14 @@ export function planLocalChanges(
   for (const path of removedPaths) {
     const indexed = fileIndexByPath[path];
     if (!indexed) continue;
+    const deleteMarker = runtimeOptions.deleteMarkers[path];
+    if (
+      !deleteMarker ||
+      deleteMarker.fileId !== indexed.fileId ||
+      deleteMarker.baseVersion !== indexed.version
+    ) {
+      continue;
+    }
     const change: SyncChangeRequest = {
       op: "delete",
       fileId: indexed.fileId,
@@ -392,6 +403,7 @@ function toQueuedChange(change: SyncChangeRequest, options: PlannerRuntimeOption
 function resolveOptions(options?: PlannerOptions): PlannerRuntimeOptions {
   return {
     now: options?.now ?? DEFAULT_OPTIONS.now,
-    newId: options?.newId ?? DEFAULT_OPTIONS.newId
+    newId: options?.newId ?? DEFAULT_OPTIONS.newId,
+    deleteMarkers: options?.deleteMarkers ?? DEFAULT_OPTIONS.deleteMarkers
   };
 }

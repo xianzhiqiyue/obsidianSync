@@ -17,6 +17,7 @@ import {
   DEFAULT_LOCAL_SYNC_STATE,
   LocalStateStore,
   type IndexedFileState,
+  type LocalDeleteMarker,
   type LocalSyncState,
   type PendingConflictSummary
 } from "./state-store";
@@ -453,7 +454,9 @@ export default class CustomSyncPlugin extends Plugin {
       this.settings.sync.mode === "bidirectional" ? await this.collectLocalSnapshots(signal) : {};
     const localPlan: LocalSyncPlan =
       this.settings.sync.mode === "bidirectional"
-        ? buildLocalPlan(failedQueue, localSnapshots, currentIndex)
+        ? buildLocalPlan(failedQueue, localSnapshots, currentIndex, {
+            deleteMarkers: this.stateStore.getLocalDeleteMarkers()
+          })
         : {
             source: "fresh",
             changes: [],
@@ -534,6 +537,7 @@ export default class CustomSyncPlugin extends Plugin {
     }
 
     await this.stateStore.clearQueue();
+    await this.stateStore.clearLocalDeleteMarkers();
 
     const snapshot = this.stateStore.getSnapshot();
     if (this.settings.enableDebugPanel) {
@@ -635,6 +639,7 @@ export default class CustomSyncPlugin extends Plugin {
         checkpoint: data?.state?.checkpoint ?? DEFAULT_LOCAL_SYNC_STATE.checkpoint,
         queue,
         fileIndexByPath: data?.state?.fileIndexByPath ?? {},
+        localDeleteMarkers: data?.state?.localDeleteMarkers ?? {},
         failure: {
           failedQueue,
           lastError: data?.state?.failure?.lastError ?? DEFAULT_LOCAL_SYNC_STATE.failure.lastError,
@@ -1266,6 +1271,7 @@ export default class CustomSyncPlugin extends Plugin {
     signal: AbortSignal
   ): Promise<void> {
     await this.stateStore.clearQueue();
+    await this.stateStore.clearLocalDeleteMarkers();
     await this.stateStore.replaceFileIndexByPath({});
     await this.stateStore.setCheckpoint(null);
 
@@ -1618,6 +1624,9 @@ export default class CustomSyncPlugin extends Plugin {
       if (!file) {
         return;
       }
+      if (kind === "delete") {
+        void this.recordLocalDeleteIntent(file);
+      }
       this.scheduleLocalChangeSync(kind, file.path);
     };
 
@@ -1625,6 +1634,47 @@ export default class CustomSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("modify", (file) => handleChange("modify", file)));
     this.registerEvent(this.app.vault.on("delete", (file) => handleChange("delete", file)));
     this.registerEvent(this.app.vault.on("rename", (file) => handleChange("rename", file)));
+  }
+
+  private async recordLocalDeleteIntent(file: TAbstractFile): Promise<void> {
+    if (this.remoteApplyDepth > 0 || Date.now() < this.suppressLocalChangeUntilMs) {
+      return;
+    }
+    if (this.settings.sync.mode !== "bidirectional" || !this.settings.vaultId) {
+      return;
+    }
+    const decision = this.shouldSyncPath(file.path);
+    if (!decision.sync) {
+      return;
+    }
+    const markers = this.buildLocalDeleteMarkers(file);
+    if (markers.length === 0) {
+      return;
+    }
+    await this.stateStore.markLocalDeletes(markers);
+  }
+
+  private buildLocalDeleteMarkers(file: TAbstractFile): LocalDeleteMarker[] {
+    const index = this.stateStore.getFileIndexByPath();
+    const indexedPaths =
+      file instanceof TFolder
+        ? Object.keys(index).filter((path) => path === file.path || path.startsWith(`${file.path}/`))
+        : [file.path];
+    const now = Date.now();
+    const markers: LocalDeleteMarker[] = [];
+    for (const path of indexedPaths) {
+      const indexed = index[path];
+      if (!indexed) {
+        continue;
+      }
+      markers.push({
+        fileId: indexed.fileId,
+        path: indexed.path,
+        baseVersion: indexed.version,
+        ts: now
+      });
+    }
+    return markers;
   }
 
   private scheduleLocalChangeSync(kind: string, path: string): void {

@@ -20,6 +20,13 @@ export interface IndexedFileState {
   ctimeMs?: number;
 }
 
+export interface LocalDeleteMarker {
+  fileId: string;
+  path: string;
+  baseVersion: number;
+  ts: number;
+}
+
 export interface SyncFailureState {
   failedQueue: QueuedChange[];
   lastError: string | null;
@@ -51,6 +58,7 @@ export interface LocalSyncState {
   checkpoint: string | null;
   queue: QueuedChange[];
   fileIndexByPath: Record<string, IndexedFileState>;
+  localDeleteMarkers: Record<string, LocalDeleteMarker>;
   failure: SyncFailureState;
   pendingConflicts: PendingConflictState;
 }
@@ -88,6 +96,7 @@ export const DEFAULT_LOCAL_SYNC_STATE: LocalSyncState = {
   checkpoint: null,
   queue: [],
   fileIndexByPath: {},
+  localDeleteMarkers: {},
   failure: DEFAULT_FAILURE_STATE,
   pendingConflicts: DEFAULT_PENDING_CONFLICT_STATE
 };
@@ -97,7 +106,10 @@ export class LocalStateStore {
   private readonly onChange: (state: LocalSyncState) => Promise<void>;
 
   constructor(
-    initialState: LocalSyncState | (Omit<LocalSyncState, "pendingConflicts"> & { pendingConflicts?: PendingConflictState }),
+    initialState: LocalSyncState | (Omit<LocalSyncState, "pendingConflicts" | "localDeleteMarkers"> & {
+      pendingConflicts?: PendingConflictState;
+      localDeleteMarkers?: Record<string, LocalDeleteMarker>;
+    }),
     onChange: (state: LocalSyncState) => Promise<void>
   ) {
     const pendingConflicts = initialState.pendingConflicts ?? DEFAULT_PENDING_CONFLICT_STATE;
@@ -105,6 +117,7 @@ export class LocalStateStore {
       checkpoint: initialState.checkpoint,
       queue: initialState.queue.map((item) => ({ ...item })),
       fileIndexByPath: { ...initialState.fileIndexByPath },
+      localDeleteMarkers: normalizeLocalDeleteMarkers(initialState.localDeleteMarkers),
       failure: {
         failedQueue: initialState.failure.failedQueue.map((item) => ({ ...item })),
         lastError: initialState.failure.lastError,
@@ -125,6 +138,7 @@ export class LocalStateStore {
       checkpoint: this.state.checkpoint,
       queue: this.state.queue.map((item) => ({ ...item })),
       fileIndexByPath: { ...this.state.fileIndexByPath },
+      localDeleteMarkers: { ...this.state.localDeleteMarkers },
       failure: {
         failedQueue: this.state.failure.failedQueue.map((item) => ({ ...item })),
         lastError: this.state.failure.lastError,
@@ -169,6 +183,27 @@ export class LocalStateStore {
 
   async replaceFileIndexByPath(indexByPath: Record<string, IndexedFileState>): Promise<void> {
     this.state.fileIndexByPath = { ...indexByPath };
+    await this.flush();
+  }
+
+  getLocalDeleteMarkers(): Record<string, LocalDeleteMarker> {
+    return { ...this.state.localDeleteMarkers };
+  }
+
+  async markLocalDelete(marker: LocalDeleteMarker): Promise<void> {
+    this.state.localDeleteMarkers[marker.path] = { ...marker };
+    await this.flush();
+  }
+
+  async markLocalDeletes(markers: LocalDeleteMarker[]): Promise<void> {
+    for (const marker of markers) {
+      this.state.localDeleteMarkers[marker.path] = { ...marker };
+    }
+    await this.flush();
+  }
+
+  async clearLocalDeleteMarkers(): Promise<void> {
+    this.state.localDeleteMarkers = {};
     await this.flush();
   }
 
@@ -229,4 +264,35 @@ export class LocalStateStore {
   private async flush(): Promise<void> {
     await this.onChange(this.getSnapshot());
   }
+}
+
+function normalizeLocalDeleteMarkers(raw: unknown): Record<string, LocalDeleteMarker> {
+  if (!raw || typeof raw !== "object") {
+    return {};
+  }
+
+  const result: Record<string, LocalDeleteMarker> = {};
+  for (const [path, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+    const marker = value as Partial<LocalDeleteMarker>;
+    if (
+      typeof marker.fileId === "string" &&
+      typeof marker.path === "string" &&
+      marker.path === path &&
+      typeof marker.baseVersion === "number" &&
+      Number.isFinite(marker.baseVersion) &&
+      typeof marker.ts === "number" &&
+      Number.isFinite(marker.ts)
+    ) {
+      result[path] = {
+        fileId: marker.fileId,
+        path: marker.path,
+        baseVersion: marker.baseVersion,
+        ts: marker.ts
+      };
+    }
+  }
+  return result;
 }

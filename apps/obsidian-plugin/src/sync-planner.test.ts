@@ -141,6 +141,69 @@ test("planLocalChanges detects move and rename from matching content hash", () =
   assert.equal(plan.queuePreview[1]?.id, "id-2");
 });
 
+test("planLocalChanges does not delete remote files just because a local folder is incomplete", () => {
+  const fileIndexByPath: Record<string, IndexedFileState> = {
+    "notes/server-only.md": {
+      fileId: "55555555-5555-5555-5555-555555555555",
+      path: "notes/server-only.md",
+      version: 4,
+      contentHash: "sha256:server"
+    }
+  };
+
+  const plan = planLocalChanges({}, fileIndexByPath);
+
+  assert.equal(plan.changes.length, 0);
+  assert.equal(plan.queuePreview.length, 0);
+});
+
+test("planLocalChanges only emits delete when there is a matching local delete marker", () => {
+  const fileIndexByPath: Record<string, IndexedFileState> = {
+    "notes/deleted.md": {
+      fileId: "66666666-6666-6666-6666-666666666666",
+      path: "notes/deleted.md",
+      version: 2,
+      contentHash: "sha256:old"
+    },
+    "notes/stale-marker.md": {
+      fileId: "77777777-7777-7777-7777-777777777777",
+      path: "notes/stale-marker.md",
+      version: 5,
+      contentHash: "sha256:stale"
+    }
+  };
+
+  const plan = planLocalChanges({}, fileIndexByPath, {
+    newId: () => "delete-id",
+    now: () => 456,
+    deleteMarkers: {
+      "notes/deleted.md": {
+        fileId: "66666666-6666-6666-6666-666666666666",
+        path: "notes/deleted.md",
+        baseVersion: 2,
+        ts: 123
+      },
+      "notes/stale-marker.md": {
+        fileId: "77777777-7777-7777-7777-777777777777",
+        path: "notes/stale-marker.md",
+        baseVersion: 4,
+        ts: 123
+      }
+    }
+  });
+
+  assert.deepEqual(plan.changes, [
+    {
+      op: "delete",
+      fileId: "66666666-6666-6666-6666-666666666666",
+      path: "notes/deleted.md",
+      baseVersion: 2
+    }
+  ]);
+  assert.equal(plan.queuePreview.length, 1);
+  assert.equal(plan.queuePreview[0]?.id, "delete-id");
+});
+
 test("normalizeQueuedChanges keeps backward compatibility with old queue format", () => {
   const normalized = normalizeQueuedChanges(
     [
