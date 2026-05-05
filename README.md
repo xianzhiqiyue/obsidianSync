@@ -12,7 +12,7 @@ Obsidian 官方同步服务在国内访问不稳定，且需要付费订阅。�
 - **离线优先**：无网环境下可正常编辑，联网后自动同步并保留待处理冲突
 - **内容寻址存储**：基于 SHA-256 内容哈希去重，服务端提交前校验对象内容
 - **多 Vault 管理**：一个账号可管理多个知识库，灵活切换
-- **设备授权**：基于 JWT 的设备注册与撤销机制，安全可控
+- **账号与设备授权**：基于邮箱密码、JWT、refresh token 轮换和设备撤销机制，安全可控
 - **冲突处理**：智能识别文件级冲突，提供待决冲突与可视化处理入口
 
 ### 技术架构
@@ -116,6 +116,11 @@ npm run migrate
 - email: `admin@example.com`
 - password: `admin123456`
 
+用户创建策略：
+- `ALLOW_SELF_REGISTRATION=false` 时公开注册接口不可见，适合生产环境。
+- 测试或内网环境可设置 `ALLOW_SELF_REGISTRATION=true`，通过 `POST /api/v1/auth/register` 创建测试用户。
+- refresh token 仅以哈希入库，每次刷新会轮换，登出或撤销设备后不可继续刷新。
+
 ## 5. 启动服务
 
 ```bash
@@ -154,6 +159,12 @@ npm run dev:admin
 
 默认预览地址：
 - `http://localhost:5173`
+
+登录方式与路由：
+- `/admin/login` 是正式登录页，填写 API 地址、邮箱、密码和设备名称后登录。
+- `/admin/` 或 `/admin/history` 是历史数据恢复控制台。
+- `/admin/users` 是用户模块，可查看账号资料、设备列表、撤销其他设备、修改显示名和修改密码。
+- 后台会自动保存 access/refresh token 并在过期前刷新，不再需要手工粘贴 access token。
 
 ## 7. API 冒烟验证
 

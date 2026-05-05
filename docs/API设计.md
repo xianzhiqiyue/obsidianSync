@@ -8,9 +8,32 @@
 - 时间格式：`ISO 8601 UTC`
 - `contentHash` 必须使用 `sha256:<64位小写十六进制>` 格式，服务端会在 commit 前校验对象内容。
 
-## 2. 认证与设备
+## 2. 认证、用户与设备
 
-### 2.1 登录并注册/更新设备
+### 2.1 受控注册用户
+- `POST /auth/register`
+- 生产环境默认不开放；测试或内网环境设置 `ALLOW_SELF_REGISTRATION=true` 后可用。若未开启，可携带 `X-Registration-Token: <BOOTSTRAP_ADMIN_TOKEN>` 做受控创建。
+
+请求：
+```json
+{
+  "email": "admin@example.com",
+  "password": "********",
+  "displayName": "管理员"
+}
+```
+
+响应：
+```json
+{
+  "userId": "550e8400-e29b-41d4-a716-446655440000",
+  "email": "admin@example.com",
+  "displayName": "管理员",
+  "createdAt": "2026-05-05T10:00:00.000Z"
+}
+```
+
+### 2.2 登录并注册/更新设备
 - `POST /auth/login`
 
 请求：
@@ -27,18 +50,102 @@
 响应：
 ```json
 {
-  "deviceId": "550e8400-e29b-41d4-a716-446655440000",
+  "user": {
+    "userId": "550e8400-e29b-41d4-a716-446655440000",
+    "email": "admin@example.com",
+    "displayName": "管理员"
+  },
+  "deviceId": "550e8400-e29b-41d4-a716-446655440001",
   "accessToken": "xxx",
   "refreshToken": "xxx",
   "expiresIn": 3600
 }
 ```
 
-### 2.2 刷新 token
+### 2.3 刷新 token
 - `POST /auth/token/refresh`
+- refresh token 每次刷新都会轮换；旧 refresh token 立即失效。
 
-### 2.3 撤销设备
-- `POST /auth/device/revoke`
+请求：
+```json
+{
+  "refreshToken": "xxx"
+}
+```
+
+响应：
+```json
+{
+  "accessToken": "xxx",
+  "refreshToken": "yyy",
+  "expiresIn": 3600
+}
+```
+
+### 2.4 登出当前会话
+- `POST /auth/logout`
+
+请求：
+```json
+{
+  "refreshToken": "yyy",
+  "revokeDevice": false
+}
+```
+
+响应：
+```json
+{
+  "status": "logged_out",
+  "deviceId": "550e8400-e29b-41d4-a716-446655440001"
+}
+```
+
+### 2.5 查询当前用户与设备
+- `GET /users/me`
+
+响应：
+```json
+{
+  "user": {
+    "userId": "550e8400-e29b-41d4-a716-446655440000",
+    "email": "admin@example.com",
+    "displayName": "管理员",
+    "createdAt": "2026-05-05T10:00:00.000Z",
+    "updatedAt": null,
+    "lastLoginAt": "2026-05-05T10:10:00.000Z"
+  },
+  "currentDeviceId": "550e8400-e29b-41d4-a716-446655440001",
+  "devices": []
+}
+```
+
+### 2.6 修改当前用户资料
+- `PATCH /users/me`
+
+请求：
+```json
+{
+  "displayName": "新的显示名"
+}
+```
+
+### 2.7 修改密码
+- `POST /users/me/password`
+- 修改成功后会撤销其他设备的 refresh token，当前设备保持可刷新。
+
+请求：
+```json
+{
+  "currentPassword": "********",
+  "newPassword": "********"
+}
+```
+
+### 2.8 查询与撤销设备
+- `GET /users/me/devices`
+- `POST /users/me/devices/{deviceId}/revoke`
+- 兼容旧入口：`POST /auth/device/revoke`。
 
 ## 3. Vault 管理
 

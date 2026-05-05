@@ -31,7 +31,8 @@ const EnvSchema = z.object({
   S3_FORCE_PATH_STYLE: toBoolean.default(true),
   SEED_ADMIN_EMAIL: z.string().email().default("admin@example.com"),
   SEED_ADMIN_PASSWORD: z.string().min(8).default("admin123456"),
-  BOOTSTRAP_ADMIN_TOKEN: z.string().min(16).optional()
+  BOOTSTRAP_ADMIN_TOKEN: z.string().min(16).optional(),
+  ALLOW_SELF_REGISTRATION: toBoolean.default(false)
 });
 
 const parsed = EnvSchema.safeParse(process.env);
@@ -63,7 +64,8 @@ export const appConfig = {
   s3ForcePathStyle: parsed.data.S3_FORCE_PATH_STYLE,
   seedAdminEmail: parsed.data.SEED_ADMIN_EMAIL,
   seedAdminPassword: parsed.data.SEED_ADMIN_PASSWORD,
-  bootstrapAdminToken: parsed.data.BOOTSTRAP_ADMIN_TOKEN
+  bootstrapAdminToken: parsed.data.BOOTSTRAP_ADMIN_TOKEN,
+  allowSelfRegistration: parsed.data.ALLOW_SELF_REGISTRATION
 };
 
 export type AppConfig = typeof appConfig;

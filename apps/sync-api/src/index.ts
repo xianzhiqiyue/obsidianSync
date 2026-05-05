@@ -13,6 +13,7 @@ import authRoutes from "./routes/auth.js";
 import adminRoutes from "./routes/admin.js";
 import syncRoutes from "./routes/sync.js";
 import systemRoutes from "./routes/system.js";
+import userRoutes from "./routes/users.js";
 import vaultRoutes from "./routes/vaults.js";
 
 
@@ -25,7 +26,8 @@ const adminContentTypes = new Map([
 
 function resolveAdminAssetPath(requestPath: string): string {
   const adminRoot = path.resolve(process.cwd(), "../admin/dist");
-  const relativePath = requestPath.replace(/^\/admin\/?/, "") || "index.html";
+  const pathname = new URL(requestPath, "http://localhost").pathname;
+  const relativePath = pathname.replace(/^\/admin\/?/, "") || "index.html";
   const safePath = path.normalize(relativePath).replace(/^\.\.(?:\/|$)/, "");
   return path.join(adminRoot, safePath);
 }
@@ -34,13 +36,22 @@ async function registerAdminUiRoutes(app: Awaited<ReturnType<typeof Fastify>>): 
   app.get("/admin", async (_request: FastifyRequest, reply: FastifyReply) => reply.redirect("/admin/"));
   app.get("/admin/*", async (request: FastifyRequest, reply: FastifyReply) => {
     const filePath = resolveAdminAssetPath(request.url);
+    const fallbackPath = resolveAdminAssetPath("/admin/index.html");
     try {
       const fileStat = await stat(filePath);
-      if (!fileStat.isFile()) {
+      if (fileStat.isFile()) {
+        const contentType = adminContentTypes.get(path.extname(filePath)) ?? "application/octet-stream";
+        return reply.header("content-type", contentType).send(createReadStream(filePath));
+      }
+    } catch {
+      const extension = path.extname(new URL(request.url, "http://localhost").pathname);
+      if (extension) {
         return reply.code(404).send({ code: "NOT_FOUND", message: "admin asset not found" });
       }
-      const contentType = adminContentTypes.get(path.extname(filePath)) ?? "application/octet-stream";
-      return reply.header("content-type", contentType).send(createReadStream(filePath));
+    }
+
+    try {
+      return reply.header("content-type", "text/html; charset=utf-8").send(createReadStream(fallbackPath));
     } catch {
       return reply.code(404).send({ code: "NOT_FOUND", message: "admin asset not found" });
     }
@@ -68,6 +79,7 @@ async function buildServer() {
   await objectStore.ensureBucket();
 
   await app.register(authRoutes, { prefix: "/api/v1" });
+  await app.register(userRoutes, { prefix: "/api/v1" });
   await app.register(adminRoutes(objectStore), { prefix: "/api/v1" });
   await app.register(vaultRoutes, { prefix: "/api/v1" });
   await app.register(syncRoutes(objectStore), { prefix: "/api/v1" });
