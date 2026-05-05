@@ -123,6 +123,9 @@ type AppState = {
   message: string;
   fileStatus: "all" | "active" | "deleted";
   fileQuery: string;
+  filePage: number;
+  filePageSize: number;
+  fileHasNextPage: boolean;
   route: RouteName;
 };
 
@@ -184,6 +187,9 @@ const state: AppState = {
   message: "请使用邮箱和密码登录。历史版本默认保留三个月。",
   fileStatus: "all",
   fileQuery: "",
+  filePage: 1,
+  filePageSize: 50,
+  fileHasNextPage: false,
   route: parseRoute()
 };
 
@@ -265,6 +271,8 @@ function clearSession(): void {
   state.previewContent = "";
   state.previewStatus = "idle";
   state.vaultQuery = "";
+  state.filePage = 1;
+  state.fileHasNextPage = false;
   localStorage.removeItem(storageKeys.accessToken);
   localStorage.removeItem(storageKeys.refreshToken);
   localStorage.removeItem(storageKeys.accessTokenExpiresAtMs);
@@ -418,10 +426,12 @@ async function loadFiles(): Promise<void> {
   if (vaultIds.length === 0) {
     state.status = "idle";
     state.message = "当前账号暂无 Vault。";
+    state.fileHasNextPage = false;
     render();
     return;
   }
-  const params = new URLSearchParams({ status: state.fileStatus, limit: "80" });
+  const cursor = Math.max(0, (state.filePage - 1) * state.filePageSize);
+  const params = new URLSearchParams({ status: state.fileStatus, limit: String(state.filePageSize), cursor: String(cursor) });
   if (state.fileQuery.trim()) params.set("query", state.fileQuery.trim());
   const batches = await Promise.all(vaultIds.map(async (vaultId) => {
     const data = await requestJson<{ items: FileSummary[] }>(`/admin/vaults/${vaultId}/files?${params.toString()}`);
@@ -432,15 +442,28 @@ async function loadFiles(): Promise<void> {
     const right = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
     return right - left;
   });
-  state.files = merged.map(({ vaultId: _vaultId, ...file }) => file);
-  state.fileVaultMap = Object.fromEntries(merged.map((file) => [file.fileId, file.vaultId]));
+  const visibleFiles = merged.slice(0, state.filePageSize);
+  state.files = visibleFiles.map(({ vaultId: _vaultId, ...file }) => file);
+  state.fileVaultMap = Object.fromEntries(visibleFiles.map((file) => [file.fileId, file.vaultId]));
+  state.fileHasNextPage = batches.some((items) => items.length >= state.filePageSize) || merged.length > state.filePageSize;
   state.selectedFileId = "";
   state.selectedFile = null;
   state.selectedFileIds.clear();
   state.detailModalOpen = false;
   state.status = "idle";
-  state.message = `已从 ${vaultIds.length} 个 Vault 载入 ${merged.length} 个文件记录。`;
+  state.message = `已从 ${vaultIds.length} 个 Vault 载入第 ${state.filePage} 页 ${visibleFiles.length} 个文件记录。`;
   render();
+}
+
+function applyFileSearchFromControls(): void {
+  state.fileQuery = document.querySelector<HTMLInputElement>("#file-query")?.value ?? "";
+  state.fileStatus = (document.querySelector<HTMLSelectElement>("#file-status")?.value as AppState["fileStatus"]) ?? "all";
+  state.filePage = 1;
+  void loadFiles().catch((error: unknown) => {
+    state.status = "error";
+    state.message = error instanceof Error ? error.message : "刷新失败";
+    render();
+  });
 }
 
 async function loadFileDetail(fileId: string, shouldRender = true): Promise<void> {
@@ -730,7 +753,7 @@ function renderVaultSearchInline(): string {
       <div class="vault-combobox-shell">
         <div class="vault-chip-row">
           ${selected.map((vault) => `
-            <button class="vault-chip" data-remove-vault-id="${vault.vaultId}" title="移除 ${escapeHtml(vault.name)}">
+            <button class="vault-chip" type="button" data-remove-vault-id="${vault.vaultId}" title="移除 ${escapeHtml(vault.name)}">
               ${escapeHtml(vault.name)} <span>×</span>
             </button>
           `).join("") || `<span class="vault-placeholder">选择一个或多个 Vault</span>`}
@@ -767,7 +790,7 @@ function renderFilesTable(): string {
         </div>
         <span>${state.files.length} 条</span>
       </div>
-      <div class="unified-search-panel">
+      <form id="file-search-form" class="unified-search-panel">
         ${renderVaultSearchInline()}
         <div class="search-block file-block">
           <label>文件路径</label>
@@ -779,8 +802,8 @@ function renderFilesTable(): string {
             ${["all", "active", "deleted"].map((item) => `<option value="${item}" ${state.fileStatus === item ? "selected" : ""}>${item}</option>`).join("")}
           </select>
         </div>
-        <button id="reload-files" class="search-submit">搜索</button>
-      </div>
+        <button id="reload-files" class="search-submit" type="submit">搜索</button>
+      </form>
       <div class="batch-toolbar">
         <label class="select-all-box">
           <input id="select-all-files" type="checkbox" ${allVisibleSelected ? "checked" : ""} ${state.files.length === 0 ? "disabled" : ""} />
@@ -789,6 +812,14 @@ function renderFilesTable(): string {
         <strong>${selectedCount} 个已选</strong>
         <button id="batch-restore-latest" class="batch-action" ${selectedCount === 0 ? "disabled" : ""}>批量恢复最新版本</button>
         <small>删除文件会恢复 head 最新版本；有效文件会以最新版本重新生成后台恢复记录，理由使用默认值。</small>
+      </div>
+
+      <div class="pagination-toolbar">
+        <span>第 ${state.filePage} 页 · 每页 ${state.filePageSize} 条</span>
+        <div class="pagination-actions">
+          <button id="prev-files-page" class="page-action" type="button" ${state.filePage <= 1 ? "disabled" : ""}>上一页</button>
+          <button id="next-files-page" class="page-action" type="button" ${!state.fileHasNextPage ? "disabled" : ""}>下一页</button>
+        </div>
       </div>
       <div class="file-table-wrap">
         <table class="file-table">
@@ -1024,6 +1055,7 @@ function bindEvents(): void {
         state.selectedVaultIds.delete(vaultId);
         state.selectedVaultId = effectiveVaultIds()[0] ?? "";
       }
+      state.filePage = 1;
       void loadFiles().catch((error: unknown) => {
         state.status = "error";
         state.message = error instanceof Error ? error.message : "读取文件失败";
@@ -1035,6 +1067,7 @@ function bindEvents(): void {
     button.addEventListener("click", () => {
       state.selectedVaultIds.delete(button.dataset.removeVaultId ?? "");
       state.selectedVaultId = effectiveVaultIds()[0] ?? "";
+      state.filePage = 1;
       void loadFiles().catch((error: unknown) => {
         state.status = "error";
         state.message = error instanceof Error ? error.message : "读取文件失败";
@@ -1042,12 +1075,25 @@ function bindEvents(): void {
       });
     });
   });
-  document.querySelector<HTMLButtonElement>("#reload-files")?.addEventListener("click", () => {
-    state.fileQuery = document.querySelector<HTMLInputElement>("#file-query")?.value ?? "";
-    state.fileStatus = (document.querySelector<HTMLSelectElement>("#file-status")?.value as AppState["fileStatus"]) ?? "all";
+  document.querySelector<HTMLFormElement>("#file-search-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    applyFileSearchFromControls();
+  });
+  document.querySelector<HTMLButtonElement>("#prev-files-page")?.addEventListener("click", () => {
+    if (state.filePage <= 1) return;
+    state.filePage -= 1;
     void loadFiles().catch((error: unknown) => {
       state.status = "error";
-      state.message = error instanceof Error ? error.message : "刷新失败";
+      state.message = error instanceof Error ? error.message : "读取上一页失败";
+      render();
+    });
+  });
+  document.querySelector<HTMLButtonElement>("#next-files-page")?.addEventListener("click", () => {
+    if (!state.fileHasNextPage) return;
+    state.filePage += 1;
+    void loadFiles().catch((error: unknown) => {
+      state.status = "error";
+      state.message = error instanceof Error ? error.message : "读取下一页失败";
       render();
     });
   });
