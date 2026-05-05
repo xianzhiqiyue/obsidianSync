@@ -22,7 +22,7 @@ const EnvSchema = z.object({
   ACCESS_TOKEN_TTL: toInteger.default(3600),
   REFRESH_TOKEN_TTL_DAYS: toInteger.default(30),
   SYNC_PREPARE_TTL_SECONDS: toInteger.default(600),
-  TOMBSTONE_RETENTION_DAYS: toInteger.default(30),
+  TOMBSTONE_RETENTION_DAYS: toInteger.default(90),
   S3_ENDPOINT: z.string().url(),
   S3_REGION: z.string().default("us-east-1"),
   S3_BUCKET: z.string().min(1),

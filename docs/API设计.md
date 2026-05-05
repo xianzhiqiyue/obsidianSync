@@ -193,7 +193,155 @@
 }
 ```
 
-## 6. 错误码
+
+## 6. 管理后台历史数据接口
+
+管理后台接口用于服务端历史数据管理，必须经过服务端鉴权与 Vault 权限校验。接口前缀统一为 `/admin`，不得由前端直连数据库。
+
+### 6.1 查询文件列表
+- `GET /admin/vaults/{vaultId}/files?query=&status=active|deleted|all&limit=50&cursor=...`
+
+响应：
+```json
+{
+  "items": [
+    {
+      "fileId": "550e8400-e29b-41d4-a716-446655440001",
+      "path": "notes/a.md",
+      "headVersion": 4,
+      "deleted": false,
+      "deletedAt": null,
+      "latestCheckpoint": "cp_1025",
+      "updatedAt": "2026-05-05T10:00:00.000Z"
+    }
+  ],
+  "nextCursor": null
+}
+```
+
+### 6.2 查询文件详情与历史版本
+- `GET /admin/vaults/{vaultId}/files/{fileId}`
+
+响应包含：
+- 当前文件状态。
+- `file_versions` 历史版本。
+- `tombstones` 删除墓碑。
+- `change_events` 同步事件。
+- 管理操作审计记录。
+
+### 6.3 预览管理操作
+- `POST /admin/vaults/{vaultId}/files/{fileId}/actions/preview`
+
+请求：
+```json
+{
+  "action": "restore",
+  "version": 3,
+  "targetPath": "notes/a-restored.md"
+}
+```
+
+响应：
+```json
+{
+  "previewId": "preview_123",
+  "confirmToken": "one-time-token",
+  "action": "restore",
+  "fileId": "550e8400-e29b-41d4-a716-446655440001",
+  "current": {
+    "path": "notes/a.md",
+    "headVersion": 4,
+    "deleted": true
+  },
+  "target": {
+    "version": 3,
+    "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "path": "notes/a-restored.md"
+  },
+  "pathConflict": false,
+  "pathConflictFileId": null,
+  "willCreateVersion": 5,
+  "willCreateCheckpoint": "cp_1026",
+  "retention": {
+    "historyRetentionDays": 90,
+    "policy": "历史版本与删除墓碑默认保留三个月"
+  }
+}
+```
+
+说明：
+- `confirmToken` 有短有效期，只能用于同一操作参数。
+- 路径冲突、对象缺失、版本不存在时必须在预览阶段暴露。
+
+### 6.4 恢复误删文件
+- `POST /admin/vaults/{vaultId}/files/{fileId}/restore`
+
+请求：
+```json
+{
+  "version": 3,
+  "targetPath": "notes/a.md",
+  "reason": "开发期间误删除，按历史版本恢复",
+  "confirmToken": "one-time-token"
+}
+```
+
+响应：
+```json
+{
+  "operationId": "550e8400-e29b-41d4-a716-446655440090",
+  "changesetId": "550e8400-e29b-41d4-a716-446655440091",
+  "newVersion": 5,
+  "newCheckpoint": "cp_1026"
+}
+```
+
+### 6.5 指定历史版本为当前版本
+- `POST /admin/vaults/{vaultId}/files/{fileId}/set-current-version`
+
+请求：
+```json
+{
+  "version": 2,
+  "targetPath": "notes/a.md",
+  "reason": "回滚到稳定版本",
+  "confirmToken": "one-time-token"
+}
+```
+
+语义：
+- 创建一个新版本号，内容哈希等于目标历史版本。
+- 插入管理来源的同步事件并推进 checkpoint。
+- 客户端通过 `sync/pull` 收到后按当前版本更新本地文件。
+
+### 6.6 软删除文件
+- `POST /admin/vaults/{vaultId}/files/{fileId}/soft-delete`
+
+请求：
+```json
+{
+  "reason": "清理错误生成的文件",
+  "confirmToken": "one-time-token"
+}
+```
+
+语义：
+- 设置 `file_entries.deleted_at`。
+- 写入 `tombstones`。
+- 插入删除同步事件。
+- 推进 checkpoint。
+
+### 6.7 查询管理操作历史
+- `GET /admin/vaults/{vaultId}/operations?fileId=&limit=50&cursor=...`
+
+响应展示操作人、操作原因、操作前后状态、关联 changeset 和 checkpoint。
+
+### 6.8 管理事件客户端兼容
+- 服务端可在 `sync/pull` 的 change item 中新增 `source`、`reason`、`adminOperationId` 字段。
+- 旧客户端必须能忽略新增字段。
+- 若新增 `restore`、`admin_set_current` op，旧客户端应按 `update` 语义兼容；若无法保证兼容，第一阶段使用 `update/delete` 表达管理操作。
+
+## 7. 错误码
 
 | HTTP | code | 含义 | 客户端动作 |
 | --- | --- | --- | --- |
@@ -204,25 +352,28 @@
 | 409 | `VERSION_CONFLICT` | base_version 不匹配 | 走冲突流程 |
 | 409 | `CHECKPOINT_MISMATCH` | checkpoint 过旧或不连续 | 重拉状态并重试 |
 | 429 | `RATE_LIMITED` | 请求过快 | 指数退避重试 |
+| 409 | `ADMIN_PATH_CONFLICT` | 管理操作目标路径冲突 | 重新选择路径或取消操作 |
+| 409 | `ADMIN_CONFIRM_REQUIRED` | 缺少有效预览确认 | 重新预览后确认 |
+| 404 | `FILE_VERSION_NOT_FOUND` | 历史版本不存在或对象不可用 | 停止操作并提示 |
 | 500 | `INTERNAL_ERROR` | 服务端异常 | 可重试并上报日志 |
 
-## 7. 幂等与一致性
+## 8. 幂等与一致性
 - 写接口必须带 `Idempotency-Key`。
 - 相同 key 的重复请求返回首次提交结果。
 - `prepare` 有有效期（建议 10 分钟），超时后必须重新 prepare。
 
-## 8. 版本策略
+## 9. 版本策略
 - API 采用路径版本：`/api/v1`。
 - 兼容性原则：
   - 可新增字段，不删除已发布字段。
   - 破坏性变更必须进入 `v2`。
 
-## 9. 系统与观测接口
+## 10. 系统与观测接口
 
-### 9.1 健康检查
+### 10.1 健康检查
 - `GET /health`
 - `GET /ready`
 
-### 9.2 指标导出
+### 10.2 指标导出
 - `GET /metrics`
 - 格式：Prometheus text format (`text/plain; version=0.0.4`)

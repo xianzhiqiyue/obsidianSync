@@ -76,6 +76,9 @@ interface ChangeEventRow {
   content_hash: string;
   mtime_ms: string | null;
   ctime_ms: string | null;
+  source?: string;
+  reason?: string | null;
+  admin_operation_id?: string | null;
 }
 
 interface SyncPrepareRow {
@@ -923,7 +926,7 @@ export default function syncRoutes(objectStore: ObjectStore) {
 
       const limit = parsed.data.limit ?? 200;
       const result = await query<ChangeEventRow>(
-        `SELECT checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms
+        `SELECT checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms, source, reason, admin_operation_id
          FROM change_events
          WHERE vault_id = $1
            AND checkpoint > $2
@@ -949,7 +952,10 @@ export default function syncRoutes(objectStore: ObjectStore) {
           version: row.version,
           contentHash: row.content_hash,
           mtimeMs: row.mtime_ms === null ? undefined : Number(row.mtime_ms),
-          ctimeMs: row.ctime_ms === null ? undefined : Number(row.ctime_ms)
+          ctimeMs: row.ctime_ms === null ? undefined : Number(row.ctime_ms),
+          source: row.source ?? "device",
+          reason: row.reason ?? undefined,
+          adminOperationId: row.admin_operation_id ?? undefined
         })),
         hasMore
       });

@@ -8,6 +8,7 @@
   ],
   "scripts": {
     "build": "npm run --workspaces build",
+    "dev:admin": "npm run --workspace @obsidian-sync/admin dev",
     "dev:api": "npm run --workspace @obsidian-sync/sync-api dev",
     "dev:plugin": "npm run --workspace @obsidian-sync/plugin dev",
     "migrate": "npm run --workspace @obsidian-sync/sync-api migrate",

@@ -34,11 +34,20 @@ Obsidian 官方同步服务在国内访问不稳定，且需要付费订阅。�
 
 - `apps/sync-api`: 同步服务端，Fastify + PostgreSQL + S3(MinIO)
 - `apps/obsidian-plugin`: Obsidian 客户端插件
+- `apps/admin`: 管理后台子项目，当前用于 Obsidian 服务器历史数据管理入口
 - `infra/`: Docker Compose 编排配置与监控组件
 - `docs/`: 架构设计、API 文档、运维手册
+- `docs/SOP.md`: 项目级交付流程、任务门禁与 Definition of Done
 - `scripts/`: 开发、测试、部署、运维脚本集合
 
 ---
+
+### 项目管理与 SOP
+
+- 项目级交付流程：`docs/SOP.md`
+- 需求与验收口径：`docs/需求文档.md`、`docs/测试与验收计划.md`
+- 管理后台历史数据管理：`docs/管理后台历史数据管理需求与设计.md`
+- 发布与运维口径：`docs/Beta发布手册.md`、`docs/部署与运维手册.md`
 
 ## 快速开始
 
@@ -134,6 +143,17 @@ npm run dev:plugin
 ```bash
 npm run --workspace @obsidian-sync/plugin test
 ```
+
+## 6.1 启动管理后台
+
+管理后台是独立子项目，提供 Obsidian 服务器历史数据查询、恢复、指定当前版本和软删除入口；历史版本与删除墓碑默认保留三个月：
+
+```bash
+npm run dev:admin
+```
+
+默认预览地址：
+- `http://localhost:5173`
 
 ## 7. API 冒烟验证
 

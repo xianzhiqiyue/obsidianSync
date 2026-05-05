@@ -22,6 +22,12 @@ DEPLOY_INCLUDE_PATHS = [
     "apps/sync-api/tsconfig.json",
     "apps/sync-api/src",
     "apps/sync-api/migrations",
+    "apps/admin/scripts",
+    "apps/admin/src",
+    "apps/admin/styles.css",
+    "apps/admin/index.html",
+    "apps/admin/tsconfig.json",
+    "apps/admin/package.json",
     "packages/shared/package.json",
     "packages/shared/tsconfig.json",
     "packages/shared/src",
@@ -94,8 +100,9 @@ LOG_DIR="$REMOTE_DIR/logs"
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 chown -R {remote_user}:{remote_user} "$REMOTE_DIR"
 su - {remote_user} -c 'mkdir -p "$HOME"/obsidianSync'
+rm -rf "$REMOTE_DIR/apps/sync-api/src" "$REMOTE_DIR/apps/sync-api/migrations" "$REMOTE_DIR/apps/admin" "$REMOTE_DIR/packages/shared/src"
 su - {remote_user} -c 'tar xzf {remote_archive_q} -C {remote_dir}'
-su - {remote_user} -c 'cd {remote_dir} && npm install && npm run --workspace @obsidian-sync/shared build && npm run --workspace @obsidian-sync/sync-api build'
+su - {remote_user} -c 'cd {remote_dir} && npm install && npm run --workspace @obsidian-sync/shared build && npm run --workspace @obsidian-sync/admin build && npm run --workspace @obsidian-sync/sync-api build && npm run migrate' 
 if [ -f "$RUN_DIR/sync-api.pid" ]; then
   PID="$(cat "$RUN_DIR/sync-api.pid" || true)"
   if [ -n "$PID" ]; then
