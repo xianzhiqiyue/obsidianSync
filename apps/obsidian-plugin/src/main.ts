@@ -109,6 +109,8 @@ const DEFAULT_AUTH_STATE: AuthState = {
 
 const SYNC_ATTEMPT_TIMEOUT_MS = 120_000;
 const FOREGROUND_SYNC_MIN_INTERVAL_MS = 15_000;
+const LOCAL_CHANGE_SYNC_DEBOUNCE_MS = 15_000;
+const CLOSE_SYNC_HANDOFF_MS = 500;
 const BLOCKED_NOTICE_COOLDOWN_MS = 10 * 60_000;
 const FAILURE_NOTICE_COOLDOWN_MS = 5 * 60_000;
 const BACKGROUND_FAILURE_NOTICE_MIN_CONSECUTIVE = 3;
@@ -144,6 +146,8 @@ export default class CustomSyncPlugin extends Plugin {
   private realtimeStatus: "disabled" | "connecting" | "connected" | "disconnected" | "error" = "disabled";
   private realtimeDetail: string | null = null;
   private localChangeDebounceTimer: number | null = null;
+  private closeSyncHandoffTimer: number | null = null;
+  private closeSyncResuming = false;
   private remoteApplyDepth = 0;
   private suppressLocalChangeUntilMs = 0;
   private activityLog: SyncActivityItem[] = [];
@@ -206,6 +210,7 @@ export default class CustomSyncPlugin extends Plugin {
     this.setupTimer();
     this.setupForegroundResumeHooks();
     this.setupLocalChangeWatcher();
+    this.setupCloseSyncHook();
     this.setupRealtimeClient();
     new Notice("自建同步插件已加载");
   }
@@ -218,6 +223,10 @@ export default class CustomSyncPlugin extends Plugin {
     if (this.localChangeDebounceTimer !== null) {
       window.clearTimeout(this.localChangeDebounceTimer);
       this.localChangeDebounceTimer = null;
+    }
+    if (this.closeSyncHandoffTimer !== null) {
+      window.clearTimeout(this.closeSyncHandoffTimer);
+      this.closeSyncHandoffTimer = null;
     }
     this.realtimeClient?.stop();
     this.realtimeClient = null;
@@ -1703,7 +1712,49 @@ export default class CustomSyncPlugin extends Plugin {
     this.localChangeDebounceTimer = window.setTimeout(() => {
       this.localChangeDebounceTimer = null;
       void this.runSyncOnce(`local-change:${kind}`);
-    }, 1500);
+    }, LOCAL_CHANGE_SYNC_DEBOUNCE_MS);
+  }
+
+  private setupCloseSyncHook(): void {
+    this.registerDomEvent(window, "beforeunload", (event: BeforeUnloadEvent) => {
+      if (this.closeSyncResuming || !this.shouldRunCloseSync()) {
+        return;
+      }
+
+      event.preventDefault();
+      this.closeSyncResuming = true;
+      this.clearScheduledLocalChangeSync();
+      void this.runSyncOnce("window-close").catch((error) => {
+        if (this.settings.enableDebugPanel) {
+          console.error("[custom-sync] close sync failed", error);
+        }
+      });
+
+      this.closeSyncHandoffTimer = window.setTimeout(() => {
+        this.closeSyncHandoffTimer = null;
+        window.close();
+      }, CLOSE_SYNC_HANDOFF_MS);
+    });
+  }
+
+  private shouldRunCloseSync(): boolean {
+    if (!this.settings.vaultId || this.settings.sync.mode !== "bidirectional") {
+      return false;
+    }
+    const snapshot = this.stateStore.getSnapshot();
+    return (
+      this.localChangeDebounceTimer !== null ||
+      snapshot.queue.length > 0 ||
+      snapshot.failure.failedQueue.length > 0
+    );
+  }
+
+  private clearScheduledLocalChangeSync(): void {
+    if (this.localChangeDebounceTimer === null) {
+      return;
+    }
+    window.clearTimeout(this.localChangeDebounceTimer);
+    this.localChangeDebounceTimer = null;
   }
 
   private setupRealtimeClient(): void {
