@@ -11,6 +11,7 @@ import { registerHttpMetricsHooks } from "./metrics.js";
 import { ObjectStore } from "./object-store.js";
 import authRoutes from "./routes/auth.js";
 import adminRoutes from "./routes/admin.js";
+import fileRoutes from "./routes/files.js";
 import syncRoutes from "./routes/sync.js";
 import systemRoutes from "./routes/system.js";
 import userRoutes from "./routes/users.js";
@@ -83,6 +84,7 @@ async function buildServer() {
   await app.register(adminRoutes(objectStore), { prefix: "/api/v1" });
   await app.register(vaultRoutes, { prefix: "/api/v1" });
   await app.register(syncRoutes(objectStore), { prefix: "/api/v1" });
+  await app.register(fileRoutes(objectStore), { prefix: "/api/v1" });
   await app.register(systemRoutes(objectStore), { prefix: "/api/v1" });
   await registerAdminUiRoutes(app);
 

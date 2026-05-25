@@ -1,4 +1,4 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, type TAbstractFile } from "obsidian";
+import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, type TAbstractFile } from "obsidian";
 import {
   type SyncChangeRequest,
   type SyncConflict,
@@ -108,9 +108,10 @@ const DEFAULT_AUTH_STATE: AuthState = {
 };
 
 const SYNC_ATTEMPT_TIMEOUT_MS = 120_000;
-const FOREGROUND_SYNC_MIN_INTERVAL_MS = 15_000;
+const FOREGROUND_SYNC_MIN_INTERVAL_MS = 2 * 60_000;
 const LOCAL_CHANGE_SYNC_DEBOUNCE_MS = 15_000;
 const CLOSE_SYNC_HANDOFF_MS = 500;
+const AUTO_SYNC_AFTER_EDIT_CHECK_MS = 2_000;
 const BLOCKED_NOTICE_COOLDOWN_MS = 10 * 60_000;
 const FAILURE_NOTICE_COOLDOWN_MS = 5 * 60_000;
 const BACKGROUND_FAILURE_NOTICE_MIN_CONSECUTIVE = 3;
@@ -147,6 +148,8 @@ export default class CustomSyncPlugin extends Plugin {
   private realtimeDetail: string | null = null;
   private localChangeDebounceTimer: number | null = null;
   private closeSyncHandoffTimer: number | null = null;
+  private pendingAutoSyncAfterEditReason: string | null = null;
+  private editExitCheckTimer: number | null = null;
   private closeSyncResuming = false;
   private remoteApplyDepth = 0;
   private suppressLocalChangeUntilMs = 0;
@@ -208,6 +211,7 @@ export default class CustomSyncPlugin extends Plugin {
     });
 
     this.setupTimer();
+    this.setupAutoSyncAfterEditHooks();
     this.setupForegroundResumeHooks();
     this.setupLocalChangeWatcher();
     this.setupCloseSyncHook();
@@ -227,6 +231,10 @@ export default class CustomSyncPlugin extends Plugin {
     if (this.closeSyncHandoffTimer !== null) {
       window.clearTimeout(this.closeSyncHandoffTimer);
       this.closeSyncHandoffTimer = null;
+    }
+    if (this.editExitCheckTimer !== null) {
+      window.clearTimeout(this.editExitCheckTimer);
+      this.editExitCheckTimer = null;
     }
     this.realtimeClient?.stop();
     this.realtimeClient = null;
@@ -274,6 +282,11 @@ export default class CustomSyncPlugin extends Plugin {
   }
 
   async runSyncOnce(reason = "manual"): Promise<void> {
+    if (this.shouldDeferAutoSyncUntilEditingEnds(reason)) {
+      this.deferAutoSyncUntilEditingEnds(reason);
+      return;
+    }
+
     if (this.syncInProgress) {
       this.pendingSync = true;
       if (this.isInteractiveTrigger(reason)) {
@@ -555,9 +568,12 @@ export default class CustomSyncPlugin extends Plugin {
       console.info("[custom-sync] queue", snapshot.queue.length);
     }
 
-    new Notice(
-      `同步完成。本地变更=${localPlan.changes.length}，队列=${snapshot.queue.length}，检查点=${snapshot.checkpoint}`
-    );
+    if (this.isInteractiveTrigger(this.lastSyncReason)) {
+      new Notice(
+        `同步完成。本地变更=${localPlan.changes.length}，队列=${snapshot.queue.length}，检查点=${snapshot.checkpoint}`,
+        2_500
+      );
+    }
   }
 
   async saveSettings(): Promise<void> {
@@ -1578,6 +1594,9 @@ export default class CustomSyncPlugin extends Plugin {
     if (reason.startsWith("local-change:")) {
       return `本地变更（${reason.slice("local-change:".length)}）`;
     }
+    if (reason.startsWith("after-edit:")) {
+      return `编辑退出后同步（${this.formatSyncReason(reason.slice("after-edit:".length))}）`;
+    }
     if (reason.startsWith("foreground:")) {
       const trigger = reason.slice("foreground:".length);
       return `前台唤醒（${trigger}）`;
@@ -1820,6 +1839,12 @@ export default class CustomSyncPlugin extends Plugin {
     });
   }
 
+  private setupAutoSyncAfterEditHooks(): void {
+    this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.flushAutoSyncAfterEditExit()));
+    this.registerEvent(this.app.workspace.on("file-open", () => this.flushAutoSyncAfterEditExit()));
+    this.registerEvent(this.app.workspace.on("layout-change", () => this.flushAutoSyncAfterEditExit()));
+  }
+
   private async triggerForegroundSync(trigger: string): Promise<void> {
     const now = Date.now();
     if (now - this.lastForegroundSyncAtMs < FOREGROUND_SYNC_MIN_INTERVAL_MS) {
@@ -1830,6 +1855,53 @@ export default class CustomSyncPlugin extends Plugin {
       console.info("[custom-sync] foreground trigger", trigger);
     }
     await this.runSyncOnce(`foreground:${trigger}`);
+  }
+
+  private shouldDeferAutoSyncUntilEditingEnds(reason: string): boolean {
+    return !this.isInteractiveTrigger(reason) && this.isActiveMarkdownEditing();
+  }
+
+  private deferAutoSyncUntilEditingEnds(reason: string): void {
+    this.pendingAutoSyncAfterEditReason = reason;
+    this.lastSyncReason = reason;
+    this.lastSyncResult = "skipped";
+    this.lastSyncError = "正在编辑页面，等待退出编辑后同步";
+    if (this.settings.enableDebugPanel) {
+      console.info("[custom-sync] auto sync deferred until editing exits", reason);
+    }
+    this.startAutoSyncAfterEditMonitor();
+  }
+
+  private flushAutoSyncAfterEditExit(): void {
+    if (!this.pendingAutoSyncAfterEditReason || this.isActiveMarkdownEditing()) {
+      return;
+    }
+
+    const reason = this.pendingAutoSyncAfterEditReason;
+    this.pendingAutoSyncAfterEditReason = null;
+    this.clearAutoSyncAfterEditMonitor();
+    void this.runSyncOnce(`after-edit:${reason}`);
+  }
+
+  private startAutoSyncAfterEditMonitor(): void {
+    if (this.editExitCheckTimer !== null) {
+      return;
+    }
+    this.editExitCheckTimer = window.setTimeout(() => {
+      this.editExitCheckTimer = null;
+      this.flushAutoSyncAfterEditExit();
+      if (this.pendingAutoSyncAfterEditReason) {
+        this.startAutoSyncAfterEditMonitor();
+      }
+    }, AUTO_SYNC_AFTER_EDIT_CHECK_MS);
+  }
+
+  private clearAutoSyncAfterEditMonitor(): void {
+    if (this.editExitCheckTimer === null) {
+      return;
+    }
+    window.clearTimeout(this.editExitCheckTimer);
+    this.editExitCheckTimer = null;
   }
 
   private setupTimer(): void {
@@ -1850,6 +1922,10 @@ export default class CustomSyncPlugin extends Plugin {
   private isMobileApp(): boolean {
     return Boolean((this.app as App & { isMobile?: boolean }).isMobile);
   }
+
+  private isActiveMarkdownEditing(): boolean {
+    return this.app.workspace.getActiveViewOfType(MarkdownView)?.getMode() === "source";
+  }
 }
 
 class SyncSettingTab extends PluginSettingTab {
@@ -1865,6 +1941,10 @@ class SyncSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.addClass("custom-sync-settings");
     containerEl.createEl("h2", { text: "自建同步设置" });
+
+    new Setting(containerEl)
+      .setName("插件版本")
+      .setDesc(`当前版本：${this.plugin.manifest.version}`);
 
     new Setting(containerEl)
       .setName("API 地址")

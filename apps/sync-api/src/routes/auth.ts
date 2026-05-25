@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { requireAuth, type AuthTokenPayload } from "../auth.js";
@@ -79,7 +80,8 @@ async function issueTokenPair(
     {
       sub: userId,
       deviceId,
-      type: "access"
+      type: "access",
+      jti: randomUUID()
     } satisfies AuthTokenPayload,
     { expiresIn: appConfig.accessTokenTtlSec }
   );
@@ -88,7 +90,8 @@ async function issueTokenPair(
     {
       sub: userId,
       deviceId,
-      type: "refresh"
+      type: "refresh",
+      jti: randomUUID()
     } satisfies AuthTokenPayload,
     { expiresIn: `${appConfig.refreshTokenTtlDays}d` }
   );

@@ -59,6 +59,16 @@ export class ObjectStore {
     );
   }
 
+  async putObjectBytes(contentHash: string, bytes: Uint8Array): Promise<void> {
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: this.toObjectKey(contentHash),
+        Body: bytes
+      })
+    );
+  }
+
   async createDownloadUrl(contentHash: string, expiresInSeconds = 900): Promise<string> {
     return getSignedUrl(
       this.client,

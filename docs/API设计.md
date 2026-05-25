@@ -484,3 +484,121 @@
 ### 10.2 指标导出
 - `GET /metrics`
 - 格式：Prometheus text format (`text/plain; version=0.0.4`)
+
+## 10. 服务端文件 API（AITodo 接入）
+
+> 详细设计见 `docs/AITodo接入服务端文件API设计.md`。本节只记录 `/api/v1` 的公开契约摘要。
+
+### 10.1 查询当前文件快照
+
+- `GET /vaults/{vaultId}/files?prefix=AI-Todo/&limit=200&cursor=<cursor>&includeDeleted=false`
+
+响应：
+
+```json
+{
+  "checkpoint": "cp_1025",
+  "items": [
+    {
+      "fileId": "550e8400-e29b-41d4-a716-446655440001",
+      "path": "AI-Todo/tasks/550e8400-e29b-41d4-a716-446655440000.md",
+      "version": 3,
+      "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "deleted": false,
+      "createdAt": "2026-04-15T06:30:00.000Z",
+      "updatedAt": "2026-04-15T06:35:00.000Z"
+    }
+  ],
+  "nextCursor": null
+}
+```
+
+### 10.2 按 path 读取文件
+
+- `GET /vaults/{vaultId}/files/by-path/{path}?includeDownloadUrl=true`
+
+响应：
+
+```json
+{
+  "file": {
+    "fileId": "550e8400-e29b-41d4-a716-446655440001",
+    "path": "AI-Todo/tasks/550e8400-e29b-41d4-a716-446655440000.md",
+    "version": 3,
+    "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "deleted": false,
+    "createdAt": "2026-04-15T06:30:00.000Z",
+    "updatedAt": "2026-04-15T06:35:00.000Z"
+  },
+  "downloadUrl": "https://obj.example.com/presigned-download-1"
+}
+```
+
+### 10.3 按 path 创建或更新文件
+
+- `PUT /vaults/{vaultId}/files/by-path/{path}`
+
+请求：
+
+```json
+{
+  "contentBase64": "LS0tCnNvdXJjZTogYWktdG9kbwotLS0KCiMgVGFzawo=",
+  "baseVersion": 2,
+  "idempotencyKey": "4dbcbf6d-2048-4d8e-a4c6-fdb2f6cfc111",
+  "conflictStrategy": "fail"
+}
+```
+
+响应：
+
+```json
+{
+  "fileId": "550e8400-e29b-41d4-a716-446655440001",
+  "path": "AI-Todo/tasks/550e8400-e29b-41d4-a716-446655440000.md",
+  "version": 3,
+  "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "checkpoint": "cp_1025",
+  "changesetId": "550e8400-e29b-41d4-a716-446655440003",
+  "op": "update"
+}
+```
+
+说明：
+
+- path 不存在时创建文件，`op=create`。
+- path 已存在时更新文件，`op=update`。
+- `baseVersion` 与当前版本不一致时返回 `409 VERSION_CONFLICT`。
+- 服务端负责写入对象存储、写元数据事务、推进 checkpoint，并生成插件端可 pull 的 `change_events`。
+
+### 10.4 按 path 删除文件
+
+- `DELETE /vaults/{vaultId}/files/by-path/{path}`
+
+请求：
+
+```json
+{
+  "baseVersion": 3,
+  "idempotencyKey": "4dbcbf6d-2048-4d8e-a4c6-fdb2f6cfc222"
+}
+```
+
+响应：
+
+```json
+{
+  "fileId": "550e8400-e29b-41d4-a716-446655440001",
+  "path": "AI-Todo/tasks/550e8400-e29b-41d4-a716-446655440000.md",
+  "version": 4,
+  "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "checkpoint": "cp_1026",
+  "changesetId": "550e8400-e29b-41d4-a716-446655440004",
+  "op": "delete"
+}
+```
+
+说明：
+
+- 删除必须写入 tombstone。
+- 删除必须写入 `change_events` 并推进 checkpoint。
+- 重试同一 `idempotencyKey` 必须返回首次响应。

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { query } from "./db.js";
 
@@ -5,6 +6,7 @@ export interface AuthTokenPayload {
   sub: string;
   deviceId: string;
   type?: "access" | "refresh";
+  jti?: string;
 }
 
 export interface AuthContext {
