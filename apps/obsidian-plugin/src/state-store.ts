@@ -7,6 +7,7 @@ export interface QueuedChange {
   contentHash?: string;
   mtimeMs?: number;
   ctimeMs?: number;
+  operationTimeMs?: number;
   attempts: number;
   ts: number;
 }
@@ -18,6 +19,7 @@ export interface IndexedFileState {
   contentHash: string;
   mtimeMs?: number;
   ctimeMs?: number;
+  operationTimeMs?: number;
 }
 
 export interface LocalDeleteMarker {

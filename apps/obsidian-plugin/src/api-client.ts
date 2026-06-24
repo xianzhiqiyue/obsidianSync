@@ -32,6 +32,7 @@ export interface SyncChangeRequest {
   contentHash?: string;
   mtimeMs?: number;
   ctimeMs?: number;
+  operationTimeMs?: number;
 }
 
 export interface SyncConflict {
@@ -48,6 +49,7 @@ export interface SyncConflict {
   remoteContentHash?: string;
   remoteMtimeMs?: number;
   remoteCtimeMs?: number;
+  remoteOperationTimeMs?: number;
 }
 
 export interface UploadTarget {
@@ -75,6 +77,7 @@ export interface SyncPullChange {
   contentHash: string;
   mtimeMs?: number;
   ctimeMs?: number;
+  operationTimeMs?: number;
 }
 
 export interface SyncPullResponse {
@@ -103,6 +106,14 @@ export interface FileVersionDownloadUrlResponse {
 interface ApiErrorPayload {
   code?: string;
   message?: string;
+}
+
+export function normalizeSyncApiBaseUrl(baseUrl: string): string {
+  const trimmedBase = baseUrl.trim().replace(/\/+$/, "");
+  if (trimmedBase.endsWith("/api/v1")) {
+    return trimmedBase;
+  }
+  return `${trimmedBase}/api/v1`;
 }
 
 export class SyncApiError extends Error {
@@ -289,7 +300,7 @@ export class SyncApiClient {
   }
 
   private toUrl(path: string): string {
-    const normalizedBase = this.baseUrl.endsWith("/") ? this.baseUrl.slice(0, -1) : this.baseUrl;
+    const normalizedBase = normalizeSyncApiBaseUrl(this.baseUrl);
     const normalizedPath = path.startsWith("/") ? path : `/${path}`;
     return `${normalizedBase}${normalizedPath}`;
   }

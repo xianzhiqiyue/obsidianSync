@@ -86,6 +86,7 @@ test("buildLocalPlan falls back to fresh scan when failed queue cannot replay", 
     op: "create",
     path: "notes/new.md",
     contentHash: "sha256:new-file",
+    operationTimeMs: 1000,
     mtimeMs: 1000
   });
   assert.equal(plan.queuePreview.length, 1);
@@ -127,6 +128,7 @@ test("planLocalChanges detects move and rename from matching content hash", () =
     fileId: "33333333-3333-3333-3333-333333333333",
     path: "notes/a.md",
     baseVersion: 3,
+    operationTimeMs: 1000,
     mtimeMs: 1000
   });
   assert.deepEqual(plan.changes[1], {
@@ -134,6 +136,7 @@ test("planLocalChanges detects move and rename from matching content hash", () =
     fileId: "44444444-4444-4444-4444-444444444444",
     path: "notes/new.md",
     baseVersion: 7,
+    operationTimeMs: 1000,
     mtimeMs: 1000
   });
   assert.equal(plan.queuePreview.length, 2);
@@ -169,7 +172,8 @@ test("planLocalChanges only emits delete when there is a matching local delete m
       fileId: "77777777-7777-7777-7777-777777777777",
       path: "notes/stale-marker.md",
       version: 5,
-      contentHash: "sha256:stale"
+      contentHash: "sha256:stale",
+      mtimeMs: 500
     }
   };
 
@@ -197,11 +201,89 @@ test("planLocalChanges only emits delete when there is a matching local delete m
       op: "delete",
       fileId: "66666666-6666-6666-6666-666666666666",
       path: "notes/deleted.md",
-      baseVersion: 2
+      baseVersion: 2,
+      operationTimeMs: 123,
+      mtimeMs: 123
     }
   ]);
   assert.equal(plan.queuePreview.length, 1);
   assert.equal(plan.queuePreview[0]?.id, "delete-id");
+});
+
+test("planLocalChanges keeps a stale delete marker when local delete is newer than remote metadata", () => {
+  const fileIndexByPath: Record<string, IndexedFileState> = {
+    "notes/deleted-after-remote-update.md": {
+      fileId: "88888888-8888-8888-8888-888888888888",
+      path: "notes/deleted-after-remote-update.md",
+      version: 3,
+      contentHash: "sha256:remote-newer-version",
+      mtimeMs: 1000
+    }
+  };
+
+  const plan = planLocalChanges({}, fileIndexByPath, {
+    newId: () => "delete-id",
+    now: () => 2000,
+    deleteMarkers: {
+      "notes/deleted-after-remote-update.md": {
+        fileId: "88888888-8888-8888-8888-888888888888",
+        path: "notes/deleted-after-remote-update.md",
+        baseVersion: 2,
+        ts: 1500
+      }
+    }
+  });
+
+  assert.deepEqual(plan.changes, [
+    {
+      op: "delete",
+      fileId: "88888888-8888-8888-8888-888888888888",
+      path: "notes/deleted-after-remote-update.md",
+      baseVersion: 3,
+      operationTimeMs: 1500,
+      mtimeMs: 1500
+    }
+  ]);
+});
+
+test("planLocalChanges applies server clock offset to operation times", () => {
+  const plan = planLocalChanges(
+    {
+      "notes/offset.md": makeSnapshot("notes/offset.md", "sha256:offset", 1000)
+    },
+    {},
+    {
+      clockOffsetMs: 250
+    }
+  );
+
+  assert.equal(plan.changes[0]?.operationTimeMs, 1250);
+  assert.equal(plan.changes[0]?.mtimeMs, 1000);
+});
+
+test("planLocalChanges drops a stale delete marker when remote metadata is newer", () => {
+  const fileIndexByPath: Record<string, IndexedFileState> = {
+    "notes/keep-remote.md": {
+      fileId: "99999999-9999-9999-9999-999999999999",
+      path: "notes/keep-remote.md",
+      version: 3,
+      contentHash: "sha256:remote-newer",
+      mtimeMs: 2000
+    }
+  };
+
+  const plan = planLocalChanges({}, fileIndexByPath, {
+    deleteMarkers: {
+      "notes/keep-remote.md": {
+        fileId: "99999999-9999-9999-9999-999999999999",
+        path: "notes/keep-remote.md",
+        baseVersion: 2,
+        ts: 1500
+      }
+    }
+  });
+
+  assert.equal(plan.changes.length, 0);
 });
 
 test("normalizeQueuedChanges keeps backward compatibility with old queue format", () => {

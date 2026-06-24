@@ -22,18 +22,21 @@ interface PlannerOptions {
   now?: () => number;
   newId?: () => string;
   deleteMarkers?: Record<string, LocalDeleteMarker>;
+  clockOffsetMs?: number;
 }
 
 interface PlannerRuntimeOptions {
   now: () => number;
   newId: () => string;
   deleteMarkers: Record<string, LocalDeleteMarker>;
+  clockOffsetMs: number;
 }
 
 const DEFAULT_OPTIONS: PlannerRuntimeOptions = {
   now: () => Date.now(),
   newId: () => crypto.randomUUID(),
-  deleteMarkers: {}
+  deleteMarkers: {},
+  clockOffsetMs: 0
 };
 
 export function isConflictCopyPath(path: string): boolean {
@@ -143,6 +146,7 @@ export function planLocalChanges(
           fileId: matched.fileId,
           path: snapshot.path,
           baseVersion: matched.version,
+          operationTimeMs: toServerOperationTime(snapshot.mtimeMs, runtimeOptions),
           mtimeMs: snapshot.mtimeMs,
           ...(snapshot.ctimeMs === undefined ? {} : { ctimeMs: snapshot.ctimeMs })
         };
@@ -156,6 +160,7 @@ export function planLocalChanges(
         op: "create",
         path: snapshot.path,
         contentHash: snapshot.contentHash,
+        operationTimeMs: toServerOperationTime(snapshot.mtimeMs, runtimeOptions),
         mtimeMs: snapshot.mtimeMs,
         ...(snapshot.ctimeMs === undefined ? {} : { ctimeMs: snapshot.ctimeMs })
       };
@@ -176,6 +181,7 @@ export function planLocalChanges(
         path: snapshot.path,
         baseVersion: indexed.version,
         contentHash: snapshot.contentHash,
+        operationTimeMs: toServerOperationTime(snapshot.mtimeMs, runtimeOptions),
         mtimeMs: snapshot.mtimeMs,
         ...(snapshot.ctimeMs === undefined ? {} : { ctimeMs: snapshot.ctimeMs })
       };
@@ -188,10 +194,12 @@ export function planLocalChanges(
     const indexed = fileIndexByPath[path];
     if (!indexed) continue;
     const deleteMarker = runtimeOptions.deleteMarkers[path];
+    if (!deleteMarker || deleteMarker.fileId !== indexed.fileId) {
+      continue;
+    }
     if (
-      !deleteMarker ||
-      deleteMarker.fileId !== indexed.fileId ||
-      deleteMarker.baseVersion !== indexed.version
+      deleteMarker.baseVersion !== indexed.version &&
+      !isLocalDeleteNewerThanIndexedFile(deleteMarker, indexed, runtimeOptions)
     ) {
       continue;
     }
@@ -199,7 +207,9 @@ export function planLocalChanges(
       op: "delete",
       fileId: indexed.fileId,
       path: indexed.path,
-      baseVersion: indexed.version
+      baseVersion: indexed.version,
+      operationTimeMs: toServerOperationTime(deleteMarker.ts, runtimeOptions),
+      mtimeMs: deleteMarker.ts
     };
     changes.push(change);
     queuePreview.push(toQueuedChange(change, runtimeOptions));
@@ -225,6 +235,7 @@ export function toSyncChangeRequest(change: QueuedChange): SyncChangeRequest | n
         op: "create",
         path: change.path,
         contentHash: change.contentHash,
+        operationTimeMs: change.operationTimeMs,
         mtimeMs: change.mtimeMs,
         ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
       };
@@ -238,6 +249,7 @@ export function toSyncChangeRequest(change: QueuedChange): SyncChangeRequest | n
         path: change.path,
         baseVersion: change.baseVersion,
         contentHash: change.contentHash,
+        operationTimeMs: change.operationTimeMs,
         mtimeMs: change.mtimeMs,
         ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
       };
@@ -250,6 +262,7 @@ export function toSyncChangeRequest(change: QueuedChange): SyncChangeRequest | n
         fileId: change.fileId,
         path: change.path,
         baseVersion: change.baseVersion,
+        operationTimeMs: change.operationTimeMs,
         mtimeMs: change.mtimeMs,
         ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
       };
@@ -263,6 +276,7 @@ export function toSyncChangeRequest(change: QueuedChange): SyncChangeRequest | n
         fileId: change.fileId,
         path: change.path,
         baseVersion: change.baseVersion,
+        operationTimeMs: change.operationTimeMs,
         mtimeMs: change.mtimeMs,
         ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
       };
@@ -354,6 +368,9 @@ export function normalizeQueuedChanges(rawQueue: unknown, options?: PlannerOptio
     const mtimeMs = typeof rawMtimeMs === "number" && Number.isFinite(rawMtimeMs) ? rawMtimeMs : undefined;
     const rawCtimeMs = raw.ctimeMs;
     const ctimeMs = typeof rawCtimeMs === "number" && Number.isFinite(rawCtimeMs) ? rawCtimeMs : undefined;
+    const rawOperationTimeMs = raw.operationTimeMs;
+    const operationTimeMs =
+      typeof rawOperationTimeMs === "number" && Number.isFinite(rawOperationTimeMs) ? rawOperationTimeMs : undefined;
     const ts = typeof raw.ts === "number" && Number.isFinite(raw.ts) ? raw.ts : runtimeOptions.now();
 
     result.push({
@@ -363,6 +380,7 @@ export function normalizeQueuedChanges(rawQueue: unknown, options?: PlannerOptio
       fileId,
       baseVersion,
       contentHash,
+      ...(operationTimeMs === undefined ? {} : { operationTimeMs }),
       ...(mtimeMs === undefined ? {} : { mtimeMs }),
       ...(ctimeMs === undefined ? {} : { ctimeMs }),
       attempts,
@@ -385,6 +403,19 @@ function parentPath(path: string): string {
   return path.slice(0, idx);
 }
 
+function isLocalDeleteNewerThanIndexedFile(
+  deleteMarker: LocalDeleteMarker,
+  indexed: IndexedFileState,
+  options: PlannerRuntimeOptions
+): boolean {
+  const remoteOperationTimeMs = indexed.operationTimeMs ?? indexed.mtimeMs;
+  return typeof remoteOperationTimeMs === "number" && toServerOperationTime(deleteMarker.ts, options) > remoteOperationTimeMs;
+}
+
+function toServerOperationTime(localTimeMs: number | undefined, options: PlannerRuntimeOptions): number {
+  return (localTimeMs ?? options.now()) + options.clockOffsetMs;
+}
+
 function toQueuedChange(change: SyncChangeRequest, options: PlannerRuntimeOptions, attempts = 0): QueuedChange {
   return {
     id: options.newId(),
@@ -393,6 +424,7 @@ function toQueuedChange(change: SyncChangeRequest, options: PlannerRuntimeOption
     fileId: change.fileId,
     baseVersion: change.baseVersion,
     contentHash: change.contentHash,
+    ...(change.operationTimeMs === undefined ? {} : { operationTimeMs: change.operationTimeMs }),
     ...(change.mtimeMs === undefined ? {} : { mtimeMs: change.mtimeMs }),
     ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs }),
     attempts,
@@ -404,6 +436,7 @@ function resolveOptions(options?: PlannerOptions): PlannerRuntimeOptions {
   return {
     now: options?.now ?? DEFAULT_OPTIONS.now,
     newId: options?.newId ?? DEFAULT_OPTIONS.newId,
-    deleteMarkers: options?.deleteMarkers ?? DEFAULT_OPTIONS.deleteMarkers
+    deleteMarkers: options?.deleteMarkers ?? DEFAULT_OPTIONS.deleteMarkers,
+    clockOffsetMs: options?.clockOffsetMs ?? DEFAULT_OPTIONS.clockOffsetMs
   };
 }

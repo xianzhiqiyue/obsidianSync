@@ -50,6 +50,7 @@ export function applyRemoteChangesToIndex(
       path: change.path,
       version: change.version,
       contentHash: change.contentHash,
+      ...(change.operationTimeMs === undefined ? {} : { operationTimeMs: change.operationTimeMs }),
       ...(change.mtimeMs === undefined ? {} : { mtimeMs: change.mtimeMs }),
       ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
     };

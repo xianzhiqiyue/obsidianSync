@@ -25,6 +25,7 @@ interface PrepareResponse {
     remoteDeleted?: boolean;
     existingFileId?: string;
     remoteContentHash?: string;
+    remoteOperationTimeMs?: number;
   }>;
 }
 
@@ -189,6 +190,7 @@ test("sync commit should be idempotent for same idempotency key", async () => {
     assert.equal(pullRes.statusCode, 200);
     assert.equal(pullRes.json().changes[0]?.mtimeMs, 1111);
     assert.equal(pullRes.json().changes[0]?.ctimeMs, 2222);
+    assert.equal(pullRes.json().changes[0]?.operationTimeMs, 1111);
 
     const commitSecondRes = await context.app.inject({
       method: "POST",
@@ -399,6 +401,185 @@ test("sync prepare should return rich metadata for deleted and version conflicts
   } finally {
     await destroyTestContext(context);
     await cleanupObjectHashes([contentHashCreate, contentHashUpdate]);
+  }
+});
+
+test("sync prepare should accept stale delete when local delete time is newer than remote update", async () => {
+  const contentHashCreate = testContentHash("delete-lww-create");
+  const contentHashUpdate = testContentHash("delete-lww-update");
+  const existingHashes = new Set([contentHashCreate, contentHashUpdate]);
+  const context = await createTestContext(existingHashes);
+  try {
+    const path = `notes/delete-lww-${randomUUID()}.md`;
+    const prepareCreateRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: {
+        baseCheckpoint: 0,
+        changes: [{ op: "create", path, contentHash: contentHashCreate, mtimeMs: 1000 }]
+      }
+    });
+    const createBody = prepareCreateRes.json() as PrepareResponse;
+    const commitCreateRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: { prepareId: createBody.prepareId, idempotencyKey: randomUUID() }
+    });
+    assert.equal(commitCreateRes.statusCode, 200);
+
+    const fileResult = await query<{ id: string }>(
+      `SELECT id
+       FROM file_entries
+       WHERE vault_id = $1 AND current_path = $2
+       LIMIT 1`,
+      [context.vaultId, path]
+    );
+    const fileId = fileResult.rows[0]?.id;
+    assert.ok(fileId);
+
+    const prepareUpdateRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: {
+        baseCheckpoint: 1,
+        changes: [{ op: "update", fileId, path, baseVersion: 1, contentHash: contentHashUpdate, mtimeMs: 2000 }]
+      }
+    });
+    const updateBody = prepareUpdateRes.json() as PrepareResponse;
+    const commitUpdateRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: { prepareId: updateBody.prepareId, idempotencyKey: randomUUID() }
+    });
+    assert.equal(commitUpdateRes.statusCode, 200);
+
+    const prepareDeleteRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: {
+        baseCheckpoint: 1,
+        changes: [{ op: "delete", fileId, path, baseVersion: 1, mtimeMs: 3000 }]
+      }
+    });
+    assert.equal(prepareDeleteRes.statusCode, 200);
+    const deleteBody = prepareDeleteRes.json() as PrepareResponse;
+    assert.equal(deleteBody.conflicts.length, 0);
+
+    const commitDeleteRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: { prepareId: deleteBody.prepareId, idempotencyKey: randomUUID() }
+    });
+    assert.equal(commitDeleteRes.statusCode, 200);
+    const deleteCommitBody = commitDeleteRes.json() as CommitResponse;
+    assert.equal(deleteCommitBody.newCheckpoint, "cp_3");
+
+    const deletedResult = await query<{ head_version: number; deleted_at: Date | null }>(
+      `SELECT head_version, deleted_at
+       FROM file_entries
+       WHERE id = $1`,
+      [fileId]
+    );
+    assert.equal(deletedResult.rows[0]?.head_version, 3);
+    assert.ok(deletedResult.rows[0]?.deleted_at);
+  } finally {
+    await destroyTestContext(context);
+    await cleanupObjectHashes([contentHashCreate, contentHashUpdate]);
+  }
+});
+
+test("sync prepare should accept stale update when local operation time is newer than remote update", async () => {
+  const contentHashCreate = testContentHash("update-lww-create");
+  const contentHashRemote = testContentHash("update-lww-remote");
+  const contentHashLocal = testContentHash("update-lww-local");
+  const existingHashes = new Set([contentHashCreate, contentHashRemote, contentHashLocal]);
+  const context = await createTestContext(existingHashes);
+  try {
+    const path = `notes/update-lww-${randomUUID()}.md`;
+    const prepareCreateRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: {
+        baseCheckpoint: 0,
+        changes: [{ op: "create", path, contentHash: contentHashCreate, operationTimeMs: 1000 }]
+      }
+    });
+    const createBody = prepareCreateRes.json() as PrepareResponse;
+    const commitCreateRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: { prepareId: createBody.prepareId, idempotencyKey: randomUUID() }
+    });
+    assert.equal(commitCreateRes.statusCode, 200);
+
+    const fileResult = await query<{ id: string }>(
+      `SELECT id
+       FROM file_entries
+       WHERE vault_id = $1 AND current_path = $2
+       LIMIT 1`,
+      [context.vaultId, path]
+    );
+    const fileId = fileResult.rows[0]?.id;
+    assert.ok(fileId);
+
+    const prepareRemoteRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: {
+        baseCheckpoint: 1,
+        changes: [{ op: "update", fileId, path, baseVersion: 1, contentHash: contentHashRemote, operationTimeMs: 2000 }]
+      }
+    });
+    const remoteBody = prepareRemoteRes.json() as PrepareResponse;
+    const commitRemoteRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: { prepareId: remoteBody.prepareId, idempotencyKey: randomUUID() }
+    });
+    assert.equal(commitRemoteRes.statusCode, 200);
+
+    const prepareLocalRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: {
+        baseCheckpoint: 1,
+        changes: [{ op: "update", fileId, path, baseVersion: 1, contentHash: contentHashLocal, operationTimeMs: 3000 }]
+      }
+    });
+    assert.equal(prepareLocalRes.statusCode, 200);
+    const localBody = prepareLocalRes.json() as PrepareResponse;
+    assert.equal(localBody.conflicts.length, 0);
+
+    const commitLocalRes = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: { prepareId: localBody.prepareId, idempotencyKey: randomUUID() }
+    });
+    assert.equal(commitLocalRes.statusCode, 200);
+
+    const pullRes = await context.app.inject({
+      method: "GET",
+      url: `/api/v1/vaults/${context.vaultId}/sync/pull?fromCheckpoint=2`,
+      headers: { authorization: `Bearer ${context.accessToken}` }
+    });
+    assert.equal(pullRes.statusCode, 200);
+    assert.equal(pullRes.json().changes[0]?.contentHash, contentHashLocal);
+    assert.equal(pullRes.json().changes[0]?.operationTimeMs, 3000);
+  } finally {
+    await destroyTestContext(context);
+    await cleanupObjectHashes([contentHashCreate, contentHashRemote, contentHashLocal]);
   }
 });
 

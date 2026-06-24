@@ -109,7 +109,7 @@ const DEFAULT_AUTH_STATE: AuthState = {
 
 const SYNC_ATTEMPT_TIMEOUT_MS = 120_000;
 const FOREGROUND_SYNC_MIN_INTERVAL_MS = 2 * 60_000;
-const LOCAL_CHANGE_SYNC_DEBOUNCE_MS = 15_000;
+const LOCAL_CHANGE_SYNC_DEBOUNCE_MS = 30_000;
 const CLOSE_SYNC_HANDOFF_MS = 500;
 const AUTO_SYNC_AFTER_EDIT_CHECK_MS = 2_000;
 const BLOCKED_NOTICE_COOLDOWN_MS = 10 * 60_000;
@@ -448,6 +448,7 @@ export default class CustomSyncPlugin extends Plugin {
     let failedQueue = this.stateStore.getFailureState().failedQueue;
     const initialState = await client.getSyncState(token, this.settings.vaultId, signal);
     const initialServerCheckpoint = this.checkpointToNumber(initialState.checkpoint);
+    const clockOffsetMs = this.calculateClockOffsetMs(initialState.serverTime);
     if (initialServerCheckpoint < initialCheckpoint || this.needsRemoteBaselineRebuild) {
       const rebuilt = await this.rebuildRemoteBaseline(client, token, initialServerCheckpoint, signal);
       initialCheckpoint = rebuilt.checkpoint;
@@ -477,7 +478,8 @@ export default class CustomSyncPlugin extends Plugin {
     const localPlan: LocalSyncPlan =
       this.settings.sync.mode === "bidirectional"
         ? buildLocalPlan(failedQueue, localSnapshots, currentIndex, {
-            deleteMarkers: this.stateStore.getLocalDeleteMarkers()
+            deleteMarkers: this.stateStore.getLocalDeleteMarkers(),
+            clockOffsetMs
           })
         : {
             source: "fresh",
@@ -841,6 +843,7 @@ export default class CustomSyncPlugin extends Plugin {
             path: change.path,
             version: change.version,
             contentHash: change.contentHash,
+            operationTimeMs: change.operationTimeMs,
             mtimeMs: change.mtimeMs,
             ctimeMs: change.ctimeMs
           };
@@ -868,6 +871,7 @@ export default class CustomSyncPlugin extends Plugin {
           path: change.path,
           version: change.version,
           contentHash: change.contentHash,
+          operationTimeMs: change.operationTimeMs,
           mtimeMs: change.mtimeMs,
           ctimeMs: change.ctimeMs
         };
@@ -1035,6 +1039,13 @@ export default class CustomSyncPlugin extends Plugin {
       await this.stateStore.replaceFileIndexByPath(repairedIndex);
     }
 
+    if (this.areAllConflictsRemoteNewer(localPlan.changes, conflicts)) {
+      await this.stateStore.clearPendingConflicts();
+      await this.rebaseToRemoteState(client, accessToken, signal);
+      new Notice("远端操作时间更新，已按最后操作优先同步远端版本。");
+      return "retry";
+    }
+
     const autoResolvedFiles = await this.buildAutoResolvedConflictFiles(
       client,
       accessToken,
@@ -1059,7 +1070,7 @@ export default class CustomSyncPlugin extends Plugin {
       await openConflictAcknowledgeModal(this.app, conflicts.filter((item) => item.remoteDeleted));
     }
     await this.stateStore.setPendingConflicts(pendingSummaries);
-    await this.rebaseToRemoteState(client, accessToken, signal);
+    await this.rebaseToRemoteState(client, accessToken, signal, pureDeleteConflicts);
     for (const path of localDeletionPaths) {
       await this.deleteLocalFileIfExists(path, signal);
     }
@@ -1290,11 +1301,37 @@ export default class CustomSyncPlugin extends Plugin {
     return conflicts.some((conflict) => conflict.remoteDeleted);
   }
 
+  private areAllConflictsRemoteNewer(changes: SyncChangeRequest[], conflicts: SyncConflict[]): boolean {
+    return (
+      conflicts.length > 0 &&
+      conflicts.every((conflict) => {
+        if (conflict.code !== "VERSION_CONFLICT") {
+          return false;
+        }
+        const change = changes[conflict.index];
+        if (!change) {
+          return false;
+        }
+        const localOperationTimeMs = change.operationTimeMs ?? change.mtimeMs;
+        const remoteOperationTimeMs = conflict.remoteOperationTimeMs ?? conflict.remoteMtimeMs;
+        return (
+          typeof localOperationTimeMs === "number" &&
+          typeof remoteOperationTimeMs === "number" &&
+          remoteOperationTimeMs >= localOperationTimeMs
+        );
+      })
+    );
+  }
+
   private async rebaseToRemoteState(
     client: SyncApiClient,
     accessToken: string,
-    signal: AbortSignal
+    signal: AbortSignal,
+    preserveLocalDeleteMarkers = false
   ): Promise<void> {
+    const localDeleteMarkers = preserveLocalDeleteMarkers
+      ? Object.values(this.stateStore.getLocalDeleteMarkers())
+      : [];
     await this.stateStore.clearQueue();
     await this.stateStore.clearLocalDeleteMarkers();
     await this.stateStore.replaceFileIndexByPath({});
@@ -1315,6 +1352,10 @@ export default class CustomSyncPlugin extends Plugin {
       if (!pulled.hasMore) {
         break;
       }
+    }
+
+    if (localDeleteMarkers.length > 0) {
+      await this.stateStore.markLocalDeletes(localDeleteMarkers);
     }
   }
 
@@ -1404,6 +1445,14 @@ export default class CustomSyncPlugin extends Plugin {
       return 0;
     }
     return Number(match[1]);
+  }
+
+  private calculateClockOffsetMs(serverTime: string): number {
+    const serverTimeMs = Date.parse(serverTime);
+    if (!Number.isFinite(serverTimeMs)) {
+      return 0;
+    }
+    return serverTimeMs - Date.now();
   }
 
   private async computeSha256(bytes: ArrayBuffer): Promise<string> {
@@ -1948,7 +1997,7 @@ class SyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("API 地址")
-      .setDesc("同步服务地址，例如：http://localhost:3000/api/v1")
+      .setDesc("同步服务地址，例如：http://localhost:3000 或 http://localhost:3000/api/v1")
       .addText((text) =>
         text.setValue(this.plugin.settings.apiBaseUrl).onChange(async (value) => {
           this.plugin.settings.apiBaseUrl = value.trim();

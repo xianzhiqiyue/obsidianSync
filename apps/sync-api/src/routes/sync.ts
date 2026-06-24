@@ -22,7 +22,8 @@ const syncChangeSchema = z.object({
   baseVersion: z.number().int().nonnegative().optional(),
   contentHash: contentHashSchema.optional(),
   mtimeMs: z.number().int().nonnegative().optional(),
-  ctimeMs: z.number().int().nonnegative().optional()
+  ctimeMs: z.number().int().nonnegative().optional(),
+  operationTimeMs: z.number().int().nonnegative().optional()
 });
 
 const prepareBodySchema = z.object({
@@ -76,6 +77,7 @@ interface ChangeEventRow {
   content_hash: string;
   mtime_ms: string | null;
   ctime_ms: string | null;
+  operation_time_ms: string | null;
   source?: string;
   reason?: string | null;
   admin_operation_id?: string | null;
@@ -104,6 +106,7 @@ interface ConflictItem {
   remoteContentHash?: string;
   remoteMtimeMs?: number;
   remoteCtimeMs?: number;
+  remoteOperationTimeMs?: number;
 }
 
 interface UploadTarget {
@@ -337,9 +340,15 @@ async function fetchLatestContentHash(client: { query: typeof query }, fileId: s
 async function fetchLatestVersionMetadata(
   client: { query: typeof query },
   fileId: string
-): Promise<{ contentHash: string; mtimeMs?: number; ctimeMs?: number }> {
-  const row = await client.query<{ content_hash: string; mtime_ms: string | null; ctime_ms: string | null }>(
-    `SELECT content_hash, mtime_ms, ctime_ms
+): Promise<{ contentHash: string; mtimeMs?: number; ctimeMs?: number; operationTimeMs?: number }> {
+  const row = await client.query<{
+    content_hash: string;
+    mtime_ms: string | null;
+    ctime_ms: string | null;
+    operation_time_ms: string | null;
+    created_at: Date;
+  }>(
+    `SELECT content_hash, mtime_ms, ctime_ms, operation_time_ms, created_at
      FROM file_versions
      WHERE file_id = $1
      ORDER BY version DESC
@@ -353,7 +362,11 @@ async function fetchLatestVersionMetadata(
   return {
     contentHash: version.content_hash,
     mtimeMs: version.mtime_ms === null ? undefined : Number(version.mtime_ms),
-    ctimeMs: version.ctime_ms === null ? undefined : Number(version.ctime_ms)
+    ctimeMs: version.ctime_ms === null ? undefined : Number(version.ctime_ms),
+    operationTimeMs:
+      version.operation_time_ms === null
+        ? Number(version.created_at.getTime())
+        : Number(version.operation_time_ms)
   };
 }
 
@@ -369,6 +382,23 @@ async function isNoopUpdate(vaultId: string, change: SyncChangeInput): Promise<b
 
   const latestContentHash = await fetchLatestContentHash({ query }, change.fileId);
   return latestContentHash === change.contentHash;
+}
+
+function isLocalOperationNewerThanRemote(
+  change: SyncChangeInput,
+  remoteMetadata: { operationTimeMs?: number; mtimeMs?: number }
+): boolean {
+  const localOperationTimeMs = change.operationTimeMs ?? change.mtimeMs;
+  const remoteOperationTimeMs = remoteMetadata.operationTimeMs ?? remoteMetadata.mtimeMs;
+  return (
+    typeof localOperationTimeMs === "number" &&
+    typeof remoteOperationTimeMs === "number" &&
+    localOperationTimeMs > remoteOperationTimeMs
+  );
+}
+
+function resolveOperationTimeMs(change: SyncChangeInput): number {
+  return change.operationTimeMs ?? change.mtimeMs ?? Date.now();
 }
 
 function parseVaultParams(
@@ -473,7 +503,8 @@ export default function syncRoutes(objectStore: ObjectStore) {
               remoteDeleted: false,
               remoteContentHash: remoteMetadata.contentHash,
               remoteMtimeMs: remoteMetadata.mtimeMs,
-              remoteCtimeMs: remoteMetadata.ctimeMs
+              remoteCtimeMs: remoteMetadata.ctimeMs,
+              remoteOperationTimeMs: remoteMetadata.operationTimeMs
             });
             continue;
           }
@@ -496,7 +527,8 @@ export default function syncRoutes(objectStore: ObjectStore) {
             remoteDeleted: Boolean(fileEntry?.deleted_at),
             remoteContentHash: remoteMetadata?.contentHash,
             remoteMtimeMs: remoteMetadata?.mtimeMs,
-            remoteCtimeMs: remoteMetadata?.ctimeMs
+            remoteCtimeMs: remoteMetadata?.ctimeMs,
+            remoteOperationTimeMs: remoteMetadata?.operationTimeMs
           });
           continue;
         }
@@ -507,6 +539,14 @@ export default function syncRoutes(objectStore: ObjectStore) {
 
         if (fileEntry.head_version !== change.baseVersion) {
           const remoteMetadata = await fetchLatestVersionMetadata({ query }, fileEntry.id);
+          if (isLocalOperationNewerThanRemote(change, remoteMetadata)) {
+            normalizedChanges.push({
+              ...change,
+              path: change.op === "update" || change.op === "delete" ? fileEntry.current_path : change.path,
+              baseVersion: fileEntry.head_version
+            });
+            continue;
+          }
           conflicts.push({
             index,
             code: "VERSION_CONFLICT",
@@ -519,7 +559,8 @@ export default function syncRoutes(objectStore: ObjectStore) {
             remoteDeleted: false,
             remoteContentHash: remoteMetadata.contentHash,
             remoteMtimeMs: remoteMetadata.mtimeMs,
-            remoteCtimeMs: remoteMetadata.ctimeMs
+            remoteCtimeMs: remoteMetadata.ctimeMs,
+            remoteOperationTimeMs: remoteMetadata.operationTimeMs
           });
           continue;
         }
@@ -543,7 +584,8 @@ export default function syncRoutes(objectStore: ObjectStore) {
             remoteDeleted: false,
             remoteContentHash: remoteMetadata.contentHash,
             remoteMtimeMs: remoteMetadata.mtimeMs,
-            remoteCtimeMs: remoteMetadata.ctimeMs
+            remoteCtimeMs: remoteMetadata.ctimeMs,
+            remoteOperationTimeMs: remoteMetadata.operationTimeMs
           });
           continue;
         }
@@ -700,6 +742,7 @@ export default function syncRoutes(objectStore: ObjectStore) {
           }
 
           for (const change of changes) {
+            const operationTimeMs = resolveOperationTimeMs(change);
             if (change.op === "create") {
               if (!change.contentHash) {
                 throw new Error("create missing contentHash");
@@ -731,14 +774,14 @@ export default function syncRoutes(objectStore: ObjectStore) {
               }
 
               await client.query(
-                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms)
-                 VALUES ($1, 1, $2, $3, $4, $5)`,
-                [fileId, change.contentHash, auth.deviceId, change.mtimeMs, change.ctimeMs]
+                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms, operation_time_ms)
+                 VALUES ($1, 1, $2, $3, $4, $5, $6)`,
+                [fileId, change.contentHash, auth.deviceId, change.mtimeMs, change.ctimeMs, operationTimeMs]
               );
               await client.query(
-                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-                [vaultId, changesetId, nextCheckpoint, "create", fileId, change.path, 1, change.contentHash, change.mtimeMs, change.ctimeMs]
+                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms, operation_time_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+                [vaultId, changesetId, nextCheckpoint, "create", fileId, change.path, 1, change.contentHash, change.mtimeMs, change.ctimeMs, operationTimeMs]
               );
               continue;
             }
@@ -779,14 +822,14 @@ export default function syncRoutes(objectStore: ObjectStore) {
                 [nextVersion, change.path, file.id]
               );
               await client.query(
-                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6)`,
-                [file.id, nextVersion, change.contentHash, auth.deviceId, change.mtimeMs, change.ctimeMs]
+                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms, operation_time_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [file.id, nextVersion, change.contentHash, auth.deviceId, change.mtimeMs, change.ctimeMs, operationTimeMs]
               );
               await client.query(
-                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-                [vaultId, changesetId, nextCheckpoint, "update", file.id, change.path, nextVersion, change.contentHash, change.mtimeMs, change.ctimeMs]
+                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms, operation_time_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+                [vaultId, changesetId, nextCheckpoint, "update", file.id, change.path, nextVersion, change.contentHash, change.mtimeMs, change.ctimeMs, operationTimeMs]
               );
               continue;
             }
@@ -799,9 +842,9 @@ export default function syncRoutes(objectStore: ObjectStore) {
                 [nextVersion, file.id]
               );
               await client.query(
-                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6)`,
-                [file.id, nextVersion, currentHash, auth.deviceId, change.mtimeMs, change.ctimeMs]
+                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms, operation_time_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [file.id, nextVersion, currentHash, auth.deviceId, change.mtimeMs, change.ctimeMs, operationTimeMs]
               );
               await client.query(
                 `INSERT INTO tombstones (vault_id, file_id, deleted_at, expire_at)
@@ -809,9 +852,9 @@ export default function syncRoutes(objectStore: ObjectStore) {
                 [vaultId, file.id, appConfig.tombstoneRetentionDays]
               );
               await client.query(
-                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-                [vaultId, changesetId, nextCheckpoint, "delete", file.id, file.current_path, nextVersion, currentHash, change.mtimeMs, change.ctimeMs]
+                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms, operation_time_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+                [vaultId, changesetId, nextCheckpoint, "delete", file.id, file.current_path, nextVersion, currentHash, change.mtimeMs, change.ctimeMs, operationTimeMs]
               );
               continue;
             }
@@ -838,14 +881,14 @@ export default function syncRoutes(objectStore: ObjectStore) {
                 [nextVersion, change.path, file.id]
               );
               await client.query(
-                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6)`,
-                [file.id, nextVersion, currentHash, auth.deviceId, change.mtimeMs, change.ctimeMs]
+                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms, operation_time_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [file.id, nextVersion, currentHash, auth.deviceId, change.mtimeMs, change.ctimeMs, operationTimeMs]
               );
               await client.query(
-                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-                [vaultId, changesetId, nextCheckpoint, change.op, file.id, change.path, nextVersion, currentHash, change.mtimeMs, change.ctimeMs]
+                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms, operation_time_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+                [vaultId, changesetId, nextCheckpoint, change.op, file.id, change.path, nextVersion, currentHash, change.mtimeMs, change.ctimeMs, operationTimeMs]
               );
               continue;
             }
@@ -926,7 +969,7 @@ export default function syncRoutes(objectStore: ObjectStore) {
 
       const limit = parsed.data.limit ?? 200;
       const result = await query<ChangeEventRow>(
-        `SELECT checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms, source, reason, admin_operation_id
+        `SELECT checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms, operation_time_ms, source, reason, admin_operation_id
          FROM change_events
          WHERE vault_id = $1
            AND checkpoint > $2
@@ -953,6 +996,7 @@ export default function syncRoutes(objectStore: ObjectStore) {
           contentHash: row.content_hash,
           mtimeMs: row.mtime_ms === null ? undefined : Number(row.mtime_ms),
           ctimeMs: row.ctime_ms === null ? undefined : Number(row.ctime_ms),
+          operationTimeMs: row.operation_time_ms === null ? undefined : Number(row.operation_time_ms),
           source: row.source ?? "device",
           reason: row.reason ?? undefined,
           adminOperationId: row.admin_operation_id ?? undefined

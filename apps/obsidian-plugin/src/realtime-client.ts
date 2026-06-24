@@ -1,3 +1,5 @@
+import { normalizeSyncApiBaseUrl } from "./api-client";
+
 export interface SyncCheckpointEvent {
   vaultId: string;
   checkpoint: string;
@@ -91,7 +93,7 @@ export class RealtimeSyncClient {
   }
 
   private streamUrl(): string {
-    const base = this.options.baseUrl.replace(/\/+$/, "");
+    const base = normalizeSyncApiBaseUrl(this.options.baseUrl);
     return `${base}/vaults/${encodeURIComponent(this.options.vaultId)}/sync/stream`;
   }
 
