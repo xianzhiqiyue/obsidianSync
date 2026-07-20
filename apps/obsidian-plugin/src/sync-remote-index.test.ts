@@ -12,7 +12,8 @@ test("applyRemoteChangesToIndex rebuilds latest index across create update renam
       fileId: "file-a",
       path: "notes/a.md",
       version: 1,
-      contentHash: "sha256:a1"
+      contentHash: "sha256:a1",
+      operationTimeMs: 1
     },
     {
       op: "update",
@@ -20,14 +21,16 @@ test("applyRemoteChangesToIndex rebuilds latest index across create update renam
       path: "notes/a.md",
       version: 2,
       contentHash: "sha256:a2",
-      mtimeMs: undefined
+      mtimeMs: undefined,
+      operationTimeMs: 2
     },
     {
       op: "rename",
       fileId: "file-a",
       path: "docs/a.md",
       version: 3,
-      contentHash: "sha256:a2"
+      contentHash: "sha256:a2",
+      operationTimeMs: 3
     },
     {
       op: "create",
@@ -35,14 +38,16 @@ test("applyRemoteChangesToIndex rebuilds latest index across create update renam
       path: "notes/b.md",
       version: 1,
       contentHash: "sha256:b1",
-      mtimeMs: undefined
+      mtimeMs: undefined,
+      operationTimeMs: 4
     },
     {
       op: "delete",
       fileId: "file-b",
       path: "notes/b.md",
       version: 2,
-      contentHash: "sha256:b1"
+      contentHash: "sha256:b1",
+      operationTimeMs: 5
     }
   ];
 
@@ -53,7 +58,9 @@ test("applyRemoteChangesToIndex rebuilds latest index across create update renam
       fileId: "file-a",
       path: "docs/a.md",
       version: 3,
-      contentHash: "sha256:a2"
+      contentHash: "sha256:a2",
+      operationTimeMs: 3,
+      materialized: false
     }
   });
 });
@@ -79,14 +86,16 @@ test("applyRemoteChangesToIndex removes stale entries by fileId when delete path
       fileId: "file-a",
       path: "notes/a.md",
       version: 4,
-      contentHash: "sha256:a2"
+      contentHash: "sha256:a2",
+      operationTimeMs: 4
     },
     {
       op: "move",
       fileId: "file-b",
       path: "archive/b.md",
       version: 2,
-      contentHash: "sha256:b1"
+      contentHash: "sha256:b1",
+      operationTimeMs: 2
     }
   ];
 
@@ -97,7 +106,9 @@ test("applyRemoteChangesToIndex removes stale entries by fileId when delete path
       fileId: "file-b",
       path: "archive/b.md",
       version: 2,
-      contentHash: "sha256:b1"
+      contentHash: "sha256:b1",
+      operationTimeMs: 2,
+      materialized: false
     }
   });
 });

@@ -5,18 +5,15 @@ export function isTextMergePath(path: string): boolean {
 }
 
 export function decideLastModifiedWins(
-  path: string,
-  localMtimeMs: number | undefined,
-  remoteMtimeMs: number | undefined
+  _path: string,
+  localOperationTimeMs: number | undefined,
+  remoteOperationTimeMs: number | undefined
 ): LastModifiedWinsDecision {
-  if (isTextMergePath(path)) {
+  if (typeof localOperationTimeMs !== "number" || !Number.isFinite(localOperationTimeMs)) {
     return "defer";
   }
-  if (typeof localMtimeMs !== "number" || !Number.isFinite(localMtimeMs)) {
+  if (typeof remoteOperationTimeMs !== "number" || !Number.isFinite(remoteOperationTimeMs)) {
     return "defer";
   }
-  if (typeof remoteMtimeMs !== "number" || !Number.isFinite(remoteMtimeMs)) {
-    return "defer";
-  }
-  return localMtimeMs > remoteMtimeMs ? "use_local" : "use_remote";
+  return localOperationTimeMs > remoteOperationTimeMs ? "use_local" : "use_remote";
 }

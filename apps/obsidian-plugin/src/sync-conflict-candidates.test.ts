@@ -61,7 +61,8 @@ test("buildConflictResolutionCandidate includes preview and stable id", () => {
         fileId: "11111111-1111-1111-1111-111111111111",
         path: "notes/a.md",
         baseVersion: 3,
-        contentHash: "sha256:new"
+        contentHash: "sha256:new",
+        operationTimeMs: 10
       }
     ]
   };

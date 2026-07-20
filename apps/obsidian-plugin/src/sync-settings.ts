@@ -1,5 +1,5 @@
 export type SyncMode = "bidirectional" | "pull_only" | "mirror_remote";
-export type ConflictStrategy = "merge" | "conflict_copy";
+export type ConflictStrategy = "last_write_wins" | "merge" | "conflict_copy";
 
 export interface AttachmentTypeSettings {
   image: boolean;
@@ -55,7 +55,7 @@ export const DEFAULT_CONFIG_SYNC_SETTINGS: ConfigSyncSettings = {
 
 export const DEFAULT_DEVICE_SYNC_SETTINGS: DeviceSyncSettings = {
   mode: "bidirectional",
-  conflictStrategy: "merge",
+  conflictStrategy: "last_write_wins",
   attachmentTypes: DEFAULT_ATTACHMENT_TYPE_SETTINGS,
   excludedFolders: [],
   configSync: DEFAULT_CONFIG_SYNC_SETTINGS,

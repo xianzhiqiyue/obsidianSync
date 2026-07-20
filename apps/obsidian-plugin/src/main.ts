@@ -8,6 +8,12 @@ import {
   SyncApiError
 } from "./api-client";
 import {
+  decidePendingDelete,
+  decideRemoteFileChange,
+  findPendingDeleteMarker,
+  inferMissingMaterializedDelete
+} from "./delete-reconciliation";
+import {
   formatActivitySummary,
   normalizeActivityLog,
   type SyncActivityItem,
@@ -28,13 +34,12 @@ import {
 } from "./conflict-resolution-modal";
 import {
   areAllConflictsLocalDeletes,
-  collectLocalDeletionPaths,
   pruneMissingFileIndexEntries
 } from "./sync-conflicts";
-import { applyRemoteChangesToIndex } from "./sync-remote-index";
 import {
   buildLocalPlan,
   isConflictCopyPath,
+  markLocalSnapshotsMaterialized,
   normalizeQueuedChanges,
   type LocalFileSnapshot,
   type LocalSyncPlan
@@ -475,6 +480,13 @@ export default class CustomSyncPlugin extends Plugin {
 
     const localSnapshots =
       this.settings.sync.mode === "bidirectional" ? await this.collectLocalSnapshots(signal) : {};
+    if (this.settings.sync.mode === "bidirectional") {
+      const materializedIndex = markLocalSnapshotsMaterialized(currentIndex, localSnapshots);
+      if (materializedIndex !== currentIndex) {
+        currentIndex = materializedIndex;
+        await this.stateStore.replaceFileIndexByPath(currentIndex);
+      }
+    }
     const localPlan: LocalSyncPlan =
       this.settings.sync.mode === "bidirectional"
         ? buildLocalPlan(failedQueue, localSnapshots, currentIndex, {
@@ -488,6 +500,20 @@ export default class CustomSyncPlugin extends Plugin {
             hashToSnapshot: {},
             droppedFailedItems: 0
           };
+    const inferredDeleteMarkers = localPlan.changes
+      .filter((change): change is SyncChangeRequest & { fileId: string; baseVersion: number } =>
+        change.op === "delete" && Boolean(change.fileId) && typeof change.baseVersion === "number"
+      )
+      .filter((change) => !this.stateStore.getLocalDeleteMarkers()[change.path])
+      .map((change) => ({
+        fileId: change.fileId,
+        path: change.path,
+        baseVersion: change.baseVersion,
+        ts: change.operationTimeMs
+      }));
+    if (inferredDeleteMarkers.length > 0) {
+      await this.stateStore.markLocalDeletes(inferredDeleteMarkers);
+    }
     await this.stateStore.replaceQueue(localPlan.queuePreview);
     if (this.settings.enableDebugPanel) {
       console.info("[custom-sync] local plan source", localPlan.source);
@@ -561,7 +587,9 @@ export default class CustomSyncPlugin extends Plugin {
     }
 
     await this.stateStore.clearQueue();
-    await this.stateStore.clearLocalDeleteMarkers();
+    await this.stateStore.clearConfirmedDeleteMarkers(
+      localPlan.changes.filter((change) => change.op === "delete")
+    );
 
     const snapshot = this.stateStore.getSnapshot();
     if (this.settings.enableDebugPanel) {
@@ -734,10 +762,192 @@ export default class CustomSyncPlugin extends Plugin {
     serverCheckpoint: number,
     signal: AbortSignal
   ): Promise<{ checkpoint: number; index: Record<string, IndexedFileState> }> {
+    const previousIndex = this.stateStore.getFileIndexByPath();
     const rebuilt = await this.fetchRemoteIndexState(client, accessToken, serverCheckpoint, signal);
-    await this.stateStore.replaceFileIndexByPath(rebuilt.index);
+    const index =
+      this.settings.sync.mode === "bidirectional"
+        ? await this.materializeRemoteBaseline(
+            client,
+            accessToken,
+            rebuilt.index,
+            rebuilt.deletedFiles,
+            previousIndex,
+            signal
+          )
+        : rebuilt.index;
+    await this.stateStore.replaceFileIndexByPath(index);
     await this.stateStore.setCheckpoint(`cp_${rebuilt.checkpoint}`);
-    return rebuilt;
+    return { ...rebuilt, index };
+  }
+
+  private async materializeRemoteBaseline(
+    client: SyncApiClient,
+    accessToken: string,
+    remoteIndex: Record<string, IndexedFileState>,
+    deletedFiles: IndexedFileState[],
+    previousIndex: Record<string, IndexedFileState>,
+    signal: AbortSignal
+  ): Promise<Record<string, IndexedFileState>> {
+    const nextIndex = { ...remoteIndex };
+    const toDownload: IndexedFileState[] = [];
+    const markers = this.stateStore.getLocalDeleteMarkers();
+    const previousByFileId = new Map(Object.values(previousIndex).map((entry) => [entry.fileId, entry]));
+    const observedLocalPaths = new Set<string>();
+
+    this.remoteApplyDepth += 1;
+    try {
+      for (const deleted of deletedFiles) {
+        this.throwIfAborted(signal);
+        if (!this.shouldSyncPath(deleted.path).sync) continue;
+        const previous = previousByFileId.get(deleted.fileId) ?? previousIndex[deleted.path];
+        if (previous?.materialized !== true) continue;
+        const marker = findPendingDeleteMarker(this.stateStore.getLocalDeleteMarkers(), deleted);
+        if (marker && decidePendingDelete(marker, deleted.operationTimeMs) === "keep_local_delete") {
+          await this.deleteLocalFileIfExists(previous.path, signal);
+          continue;
+        }
+        const local = await this.readLocalFileVersion(previous.path, signal);
+        if (
+          local &&
+          decideRemoteFileChange({
+            ...local,
+            indexedContentHash: previous.contentHash,
+            remoteOperationTimeMs: deleted.operationTimeMs
+          }) === "keep_local"
+        ) {
+          this.pendingSync = true;
+          continue;
+        }
+        await this.deleteLocalFileIfExists(previous.path, signal);
+        if (marker) await this.stateStore.removeLocalDeleteMarker(marker.path, marker);
+      }
+    } finally {
+      this.remoteApplyDepth -= 1;
+    }
+
+    for (const remote of Object.values(remoteIndex)) {
+      this.throwIfAborted(signal);
+      if (!this.shouldSyncPath(remote.path).sync) {
+        continue;
+      }
+      const previous = previousByFileId.get(remote.fileId);
+      if (
+        previous?.materialized === true &&
+        previous.path !== remote.path &&
+        this.app.vault.getAbstractFileByPath(previous.path) instanceof TFile &&
+        !this.app.vault.getAbstractFileByPath(remote.path)
+      ) {
+        this.remoteApplyDepth += 1;
+        try {
+          await this.renameLocalFileIfExists(previous.path, remote.path, signal);
+        } finally {
+          this.remoteApplyDepth -= 1;
+        }
+      }
+      const local = await this.readLocalFileVersion(remote.path, signal);
+      if (local) observedLocalPaths.add(remote.path);
+      let marker = findPendingDeleteMarker(markers, remote);
+      if (!local) {
+        const previousEntry = previousByFileId.get(remote.fileId) ?? previousIndex[remote.path];
+        const previousFileExists = Boolean(
+          previousEntry && this.app.vault.getAbstractFileByPath(previousEntry.path) instanceof TFile
+        );
+        if (!marker && previousEntry?.materialized === true && !previousFileExists) {
+          marker = { fileId: remote.fileId, path: remote.path, baseVersion: remote.version, ts: Date.now() };
+          await this.stateStore.markLocalDelete(marker);
+        }
+        if (marker && decidePendingDelete(marker, remote.operationTimeMs) === "keep_local_delete") {
+          await this.stateStore.rebaseLocalDeleteMarker(marker, remote.path, remote.fileId, remote.version);
+          this.pendingSync = true;
+          continue;
+        }
+        if (marker) {
+          await this.stateStore.removeLocalDeleteMarker(marker.path, marker);
+        }
+        toDownload.push(remote);
+        continue;
+      }
+
+      if (
+        decideRemoteFileChange({
+          ...local,
+          remoteContentHash: remote.contentHash,
+          remoteOperationTimeMs: remote.operationTimeMs
+        }) === "keep_local"
+      ) {
+        nextIndex[remote.path] = { ...remote, materialized: true };
+        this.pendingSync = true;
+        continue;
+      }
+      if (local.localContentHash === remote.contentHash) {
+        nextIndex[remote.path] = { ...remote, materialized: true };
+        continue;
+      }
+      toDownload.push(remote);
+    }
+
+    if (toDownload.length === 0) {
+      return nextIndex;
+    }
+    const hashes = Array.from(new Set(toDownload.map((entry) => entry.contentHash)));
+    const urls = await client.getDownloadUrls(accessToken, this.settings.vaultId, hashes, signal);
+    const urlByHash = new Map(urls.items.map((item) => [item.contentHash, item.downloadUrl]));
+    const bytesByHash = new Map<string, ArrayBuffer>();
+    await this.mapWithConcurrency(
+      hashes,
+      MAX_DOWNLOAD_CONCURRENCY,
+      async (hash) => {
+        const url = urlByHash.get(hash);
+        if (!url) throw new Error(`缺少内容哈希 ${hash} 的下载地址。`);
+        bytesByHash.set(hash, await client.downloadObject(url, signal));
+      },
+      signal
+    );
+
+    for (const remote of toDownload) {
+      const bytes = bytesByHash.get(remote.contentHash);
+      if (!bytes) throw new Error(`缺少内容哈希 ${remote.contentHash} 对应的下载数据。`);
+      let marker = findPendingDeleteMarker(this.stateStore.getLocalDeleteMarkers(), remote);
+      const latestLocal = await this.readLocalFileVersion(remote.path, signal);
+      if (!marker && !latestLocal && observedLocalPaths.has(remote.path)) {
+        marker = { fileId: remote.fileId, path: remote.path, baseVersion: remote.version, ts: Date.now() };
+        await this.stateStore.markLocalDelete(marker);
+      }
+      if (marker && decidePendingDelete(marker, remote.operationTimeMs) === "keep_local_delete") {
+        nextIndex[remote.path] = { ...remote, materialized: false };
+        await this.stateStore.rebaseLocalDeleteMarker(marker, remote.path, remote.fileId, remote.version);
+        this.pendingSync = true;
+        continue;
+      }
+      if (
+        latestLocal &&
+        decideRemoteFileChange({
+          ...latestLocal,
+          remoteContentHash: remote.contentHash,
+          remoteOperationTimeMs: remote.operationTimeMs
+        }) === "keep_local"
+      ) {
+        nextIndex[remote.path] = { ...remote, materialized: true };
+        this.pendingSync = true;
+        continue;
+      }
+      if (marker) await this.stateStore.removeLocalDeleteMarker(marker.path, marker);
+      if (latestLocal?.localContentHash === remote.contentHash) {
+        nextIndex[remote.path] = { ...remote, materialized: true };
+        continue;
+      }
+      this.remoteApplyDepth += 1;
+      try {
+        await this.writeLocalFile(remote.path, bytes, signal, {
+          mtimeMs: remote.mtimeMs,
+          ctimeMs: remote.ctimeMs
+        });
+      } finally {
+        this.remoteApplyDepth -= 1;
+      }
+      nextIndex[remote.path] = { ...remote, materialized: true };
+    }
+    return nextIndex;
   }
 
   private async fetchRemoteIndexState(
@@ -745,35 +955,46 @@ export default class CustomSyncPlugin extends Plugin {
     accessToken: string,
     serverCheckpoint: number,
     signal: AbortSignal
-  ): Promise<{ checkpoint: number; index: Record<string, IndexedFileState> }> {
-    if (serverCheckpoint === 0) {
-      return {
-        checkpoint: 0,
-        index: {}
-      };
-    }
-
-    let nextCheckpoint = 0;
-    let rebuiltIndex: Record<string, IndexedFileState> = {};
-    while (true) {
-      this.throwIfAborted(signal);
-      const pulled = await client.pull(accessToken, this.settings.vaultId, nextCheckpoint, 200, signal);
-      rebuiltIndex = applyRemoteChangesToIndex(rebuiltIndex, pulled.changes);
-      nextCheckpoint = this.checkpointToNumber(pulled.toCheckpoint);
-      if (!pulled.hasMore) {
-        break;
-      }
-    }
-
-    if (nextCheckpoint < serverCheckpoint) {
+  ): Promise<{
+    checkpoint: number;
+    index: Record<string, IndexedFileState>;
+    deletedFiles: IndexedFileState[];
+  }> {
+    const snapshot = await client.snapshot(accessToken, this.settings.vaultId, signal);
+    const snapshotCheckpoint = this.checkpointToNumber(snapshot.checkpoint);
+    if (snapshotCheckpoint < serverCheckpoint) {
       throw new Error(
-        `远端状态重建不完整：服务端检查点=cp_${serverCheckpoint}，重建到=cp_${nextCheckpoint}。`
+        `远端状态重建不完整：服务端检查点=cp_${serverCheckpoint}，快照到=cp_${snapshotCheckpoint}。`
       );
     }
 
+    const rebuiltIndex: Record<string, IndexedFileState> = {};
+    for (const file of snapshot.files) {
+      rebuiltIndex[file.path] = {
+        fileId: file.fileId,
+        path: file.path,
+        version: file.version,
+        contentHash: file.contentHash,
+        ...(file.mtimeMs === undefined ? {} : { mtimeMs: file.mtimeMs }),
+        ...(file.ctimeMs === undefined ? {} : { ctimeMs: file.ctimeMs }),
+        operationTimeMs: file.operationTimeMs,
+        materialized: false
+      };
+    }
+
     return {
-      checkpoint: nextCheckpoint,
-      index: rebuiltIndex
+      checkpoint: snapshotCheckpoint,
+      index: rebuiltIndex,
+      deletedFiles: snapshot.deletedFiles.map((file) => ({
+        fileId: file.fileId,
+        path: file.path,
+        version: file.version,
+        contentHash: file.contentHash,
+        ...(file.mtimeMs === undefined ? {} : { mtimeMs: file.mtimeMs }),
+        ...(file.ctimeMs === undefined ? {} : { ctimeMs: file.ctimeMs }),
+        operationTimeMs: file.operationTimeMs,
+        materialized: false
+      }))
     };
   }
 
@@ -820,6 +1041,26 @@ export default class CustomSyncPlugin extends Plugin {
         this.throwIfAborted(signal);
         if (change.op === "delete") {
           const existingPath = fileIdToPath[change.fileId] ?? change.path;
+          const marker = findPendingDeleteMarker(this.stateStore.getLocalDeleteMarkers(), change);
+          const preserveNewerMarker = Boolean(
+            marker && decidePendingDelete(marker, change.operationTimeMs) === "keep_local_delete"
+          );
+          const indexed = nextIndex[existingPath];
+          const localVersion = await this.readLocalFileVersion(existingPath, signal);
+          if (
+            localVersion &&
+            decideRemoteFileChange({
+              ...localVersion,
+              indexedContentHash: indexed?.contentHash,
+              remoteOperationTimeMs: change.operationTimeMs
+            }) === "keep_local"
+          ) {
+            delete fileIdToPath[change.fileId];
+            if (indexed) delete nextIndex[existingPath];
+            this.pendingSync = true;
+            this.recordActivity("skipped", "本地内容操作更新时间更晚，已保留文件并等待重新创建", existingPath);
+            continue;
+          }
           await this.deleteLocalFileIfExists(existingPath, signal);
           delete fileIdToPath[change.fileId];
           if (nextIndex[existingPath]) {
@@ -831,11 +1072,57 @@ export default class CustomSyncPlugin extends Plugin {
               }
             }
           }
+          if (marker && !preserveNewerMarker) {
+            await this.stateStore.removeLocalDeleteMarker(marker.path, marker);
+          }
           continue;
+        }
+
+        let pendingDelete = findPendingDeleteMarker(this.stateStore.getLocalDeleteMarkers(), change);
+        if (!pendingDelete) {
+          const indexedPath = fileIdToPath[change.fileId] ?? change.path;
+          const indexed = nextIndex[indexedPath];
+          const localFileExists =
+            this.app.vault.getAbstractFileByPath(indexedPath) instanceof TFile ||
+            this.app.vault.getAbstractFileByPath(change.path) instanceof TFile;
+          const inferredDelete = inferMissingMaterializedDelete(indexed, localFileExists, Date.now());
+          if (inferredDelete) {
+            await this.stateStore.markLocalDelete(inferredDelete);
+            pendingDelete = inferredDelete;
+          }
+        }
+        if (pendingDelete) {
+          const decision = decidePendingDelete(pendingDelete, change.operationTimeMs);
+          if (decision === "keep_local_delete") {
+            const previousPath = fileIdToPath[change.fileId];
+            if (previousPath && previousPath !== change.path) delete nextIndex[previousPath];
+            nextIndex[change.path] = {
+              fileId: change.fileId,
+              path: change.path,
+              version: change.version,
+              contentHash: change.contentHash,
+              ...(change.mtimeMs === undefined ? {} : { mtimeMs: change.mtimeMs }),
+              ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs }),
+              operationTimeMs: change.operationTimeMs,
+              materialized: false
+            };
+            fileIdToPath[change.fileId] = change.path;
+            await this.stateStore.rebaseLocalDeleteMarker(
+              pendingDelete,
+              change.path,
+              change.fileId,
+              change.version
+            );
+            this.pendingSync = true;
+            this.recordActivity("skipped", "本地删除操作更新时间更晚，已延后远端内容写回", change.path);
+            continue;
+          }
+          await this.stateStore.removeLocalDeleteMarker(pendingDelete.path, pendingDelete);
         }
 
         const previousPath = fileIdToPath[change.fileId];
         if ((change.op === "rename" || change.op === "move") && previousPath && previousPath !== change.path) {
+          const wasMaterialized = nextIndex[previousPath]?.materialized === true;
           await this.renameLocalFileIfExists(previousPath, change.path, signal);
           delete nextIndex[previousPath];
           nextIndex[change.path] = {
@@ -845,7 +1132,8 @@ export default class CustomSyncPlugin extends Plugin {
             contentHash: change.contentHash,
             operationTimeMs: change.operationTimeMs,
             mtimeMs: change.mtimeMs,
-            ctimeMs: change.ctimeMs
+            ctimeMs: change.ctimeMs,
+            materialized: wasMaterialized
           };
           fileIdToPath[change.fileId] = change.path;
           continue;
@@ -853,6 +1141,36 @@ export default class CustomSyncPlugin extends Plugin {
 
         if (change.op !== "create" && change.op !== "update") {
           throw new Error(`收到不支持的远端操作：${change.op}`);
+        }
+
+        const localVersion = await this.readLocalFileVersion(change.path, signal);
+        const indexedAtPath = nextIndex[change.path];
+        if (
+          localVersion &&
+          decideRemoteFileChange({
+            ...localVersion,
+            indexedContentHash: indexedAtPath?.contentHash,
+            remoteContentHash: change.contentHash,
+            remoteOperationTimeMs: change.operationTimeMs
+          }) === "keep_local"
+        ) {
+          if (previousPath && previousPath !== change.path) {
+            delete nextIndex[previousPath];
+          }
+          nextIndex[change.path] = {
+            fileId: change.fileId,
+            path: change.path,
+            version: change.version,
+            contentHash: change.contentHash,
+            ...(change.mtimeMs === undefined ? {} : { mtimeMs: change.mtimeMs }),
+            ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs }),
+            operationTimeMs: change.operationTimeMs,
+            materialized: true
+          };
+          fileIdToPath[change.fileId] = change.path;
+          this.pendingSync = true;
+          this.recordActivity("skipped", "本地内容操作更新时间更晚，已延后远端内容写回", change.path);
+          continue;
         }
 
         const bytes = bytesByHash.get(change.contentHash);
@@ -873,13 +1191,31 @@ export default class CustomSyncPlugin extends Plugin {
           contentHash: change.contentHash,
           operationTimeMs: change.operationTimeMs,
           mtimeMs: change.mtimeMs,
-          ctimeMs: change.ctimeMs
+          ctimeMs: change.ctimeMs,
+          materialized: true
         };
         fileIdToPath[change.fileId] = change.path;
       }
     }
 
     return nextIndex;
+  }
+
+  private async readLocalFileVersion(
+    path: string,
+    signal: AbortSignal
+  ): Promise<{ localContentHash: string; localMtimeMs: number } | null> {
+    this.throwIfAborted(signal);
+    const local = this.app.vault.getAbstractFileByPath(path);
+    if (!(local instanceof TFile)) {
+      return null;
+    }
+    const bytes = await this.app.vault.readBinary(local);
+    this.throwIfAborted(signal);
+    return {
+      localContentHash: await this.computeSha256(bytes),
+      localMtimeMs: local.stat.mtime
+    };
   }
 
 
@@ -936,7 +1272,7 @@ export default class CustomSyncPlugin extends Plugin {
       }
     } finally {
       this.remoteApplyDepth -= 1;
-      this.suppressLocalChangeUntilMs = Date.now() + 1000;
+      this.suppressLocalChangeUntilMs = Date.now();
     }
 
     return { ...remoteIndexByPath };
@@ -1033,7 +1369,6 @@ export default class CustomSyncPlugin extends Plugin {
     signal: AbortSignal
   ): Promise<"retry" | "pending"> {
     const repairedIndex = pruneMissingFileIndexEntries(currentIndex, localPlan.changes, conflicts);
-    const localDeletionPaths = collectLocalDeletionPaths(localPlan.changes, conflicts);
     const pureDeleteConflicts = areAllConflictsLocalDeletes(localPlan.changes, conflicts);
     if (repairedIndex !== currentIndex) {
       await this.stateStore.replaceFileIndexByPath(repairedIndex);
@@ -1064,21 +1399,20 @@ export default class CustomSyncPlugin extends Plugin {
       return "retry";
     }
 
+    if (pureDeleteConflicts) {
+      await this.rebaseToRemoteState(client, accessToken, signal);
+      await this.stateStore.clearPendingConflicts();
+      new Notice("已按操作时间处理删除冲突，正在重新计算待提交变更。");
+      return "retry";
+    }
+
     const pendingSummaries = await this.buildPendingConflictSummaries(localPlan, conflicts, signal);
     new Notice(`已保存 ${pendingSummaries.length} 个待处理冲突，当前已回到远端最新状态。`);
     if (interactive && this.hasRemoteDeletedConflicts(conflicts) && !signal.aborted) {
       await openConflictAcknowledgeModal(this.app, conflicts.filter((item) => item.remoteDeleted));
     }
     await this.stateStore.setPendingConflicts(pendingSummaries);
-    await this.rebaseToRemoteState(client, accessToken, signal, pureDeleteConflicts);
-    for (const path of localDeletionPaths) {
-      await this.deleteLocalFileIfExists(path, signal);
-    }
-    if (pureDeleteConflicts) {
-      await this.stateStore.clearPendingConflicts();
-      new Notice("检测到纯删除冲突，已自动按本地删除意图重新提交。");
-      return "retry";
-    }
+    await this.rebaseToRemoteState(client, accessToken, signal);
     return "pending";
   }
 
@@ -1094,9 +1428,13 @@ export default class CustomSyncPlugin extends Plugin {
     conflicts: SyncConflict[],
     signal: AbortSignal
   ): Promise<Array<{ path: string; bytes: ArrayBuffer }> | null> {
-    return this.settings.sync.conflictStrategy === "merge"
-      ? this.buildAutoMergedTextConflictFiles(client, accessToken, localPlan, conflicts, signal)
-      : this.buildLastModifiedWinsConflictFiles(client, accessToken, localPlan, conflicts, signal);
+    if (this.settings.sync.conflictStrategy === "merge") {
+      return this.buildAutoMergedTextConflictFiles(client, accessToken, localPlan, conflicts, signal);
+    }
+    if (this.settings.sync.conflictStrategy === "last_write_wins") {
+      return this.buildLastModifiedWinsConflictFiles(client, accessToken, localPlan, conflicts, signal);
+    }
+    return null;
   }
 
   private async buildAutoMergedTextConflictFiles(
@@ -1166,20 +1504,36 @@ export default class CustomSyncPlugin extends Plugin {
     signal: AbortSignal
   ): Promise<Array<{ path: string; bytes: ArrayBuffer }> | null> {
     const files: Array<{ path: string; bytes: ArrayBuffer }> = [];
+    let handledConflicts = 0;
     for (const conflict of conflicts) {
       this.throwIfAborted(signal);
       const change = localPlan.changes[conflict.index];
       const path = change?.path ?? conflict.path;
-      if (conflict.code !== "VERSION_CONFLICT" || !change?.fileId) {
+      if (
+        !change ||
+        (conflict.code !== "VERSION_CONFLICT" &&
+          conflict.code !== "FILE_NOT_FOUND" &&
+          conflict.code !== "PATH_TOMBSTONE_CONFLICT" &&
+          !(conflict.code === "PATH_CONFLICT" && change.op === "create"))
+      ) {
         return null;
       }
 
-      const decision = decideLastModifiedWins(path, change.mtimeMs, conflict.remoteMtimeMs);
+      const decision = decideLastModifiedWins(
+        path,
+        change.operationTimeMs,
+        conflict.remoteOperationTimeMs ?? conflict.remoteMtimeMs
+      );
       if (decision === "defer") {
         return null;
       }
+      handledConflicts += 1;
 
       if (decision === "use_local") {
+        if (change.op === "delete") {
+          // 删除没有可写回的内容，交给 rebase 后的删除 marker 重新提交。
+          return null;
+        }
         const localBytes = await this.readConflictBytes(path, change.contentHash, localPlan.hashToSnapshot);
         if (!localBytes) {
           return null;
@@ -1187,19 +1541,10 @@ export default class CustomSyncPlugin extends Plugin {
         files.push({ path, bytes: localBytes });
         continue;
       }
-
-      if (!conflict.remoteContentHash) {
-        return null;
-      }
-      const remoteUrls = await client.getDownloadUrls(accessToken, this.settings.vaultId, [conflict.remoteContentHash], signal);
-      const remoteUrl = remoteUrls.items.find((item) => item.contentHash === conflict.remoteContentHash)?.downloadUrl;
-      if (!remoteUrl) {
-        return null;
-      }
-      files.push({ path, bytes: await client.downloadObject(remoteUrl, signal) });
+      // 远端获胜时 rebase 本身就会恢复远端文件或删除本地文件，无需再次写盘。
     }
 
-    return files.length > 0 ? files : null;
+    return handledConflicts > 0 ? files : null;
   }
 
   private decodeUtf8(bytes: ArrayBuffer): string {
@@ -1333,7 +1678,6 @@ export default class CustomSyncPlugin extends Plugin {
       ? Object.values(this.stateStore.getLocalDeleteMarkers())
       : [];
     await this.stateStore.clearQueue();
-    await this.stateStore.clearLocalDeleteMarkers();
     await this.stateStore.replaceFileIndexByPath({});
     await this.stateStore.setCheckpoint(null);
 
@@ -1343,7 +1687,13 @@ export default class CustomSyncPlugin extends Plugin {
       this.throwIfAborted(signal);
       const pulled = await client.pull(accessToken, this.settings.vaultId, nextCheckpoint, 200, signal);
       if (pulled.changes.length > 0) {
-        updatedIndex = await this.applyRemoteChanges(client, accessToken, updatedIndex, pulled.changes, signal);
+        updatedIndex = await this.applyRemoteChangesWithSuppression(
+          client,
+          accessToken,
+          updatedIndex,
+          pulled.changes,
+          signal
+        );
         await this.stateStore.replaceFileIndexByPath(updatedIndex);
       }
 
@@ -1483,7 +1833,7 @@ export default class CustomSyncPlugin extends Plugin {
 
   private isRetryableError(error: unknown): boolean {
     if (error instanceof SyncApiError) {
-      if (error.status >= 500 || error.status === 429) {
+      if (error.status >= 500 || error.status === 429 || error.status === 409) {
         return true;
       }
       if (error.code === "UPLOAD_FAILED" || error.code === "DOWNLOAD_FAILED") {
@@ -1703,6 +2053,8 @@ export default class CustomSyncPlugin extends Plugin {
       }
       if (kind === "delete") {
         void this.recordLocalDeleteIntent(file);
+      } else {
+        void this.clearLocalDeleteIntentForExistingFile(file);
       }
       this.scheduleLocalChangeSync(kind, file.path);
     };
@@ -1711,6 +2063,16 @@ export default class CustomSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("modify", (file) => handleChange("modify", file)));
     this.registerEvent(this.app.vault.on("delete", (file) => handleChange("delete", file)));
     this.registerEvent(this.app.vault.on("rename", (file) => handleChange("rename", file)));
+  }
+
+  private async clearLocalDeleteIntentForExistingFile(file: TAbstractFile): Promise<void> {
+    if (this.remoteApplyDepth > 0 || Date.now() < this.suppressLocalChangeUntilMs || !(file instanceof TFile)) {
+      return;
+    }
+    const marker = this.stateStore.getLocalDeleteMarkers()[file.path];
+    if (marker && file.stat.mtime >= marker.ts) {
+      await this.stateStore.removeLocalDeleteMarker(file.path, marker);
+    }
   }
 
   private async recordLocalDeleteIntent(file: TAbstractFile): Promise<void> {
@@ -1869,7 +2231,7 @@ export default class CustomSyncPlugin extends Plugin {
       return await this.applyRemoteChanges(client, accessToken, currentIndex, remoteChanges, signal);
     } finally {
       this.remoteApplyDepth -= 1;
-      this.suppressLocalChangeUntilMs = Date.now() + 1000;
+      this.suppressLocalChangeUntilMs = Date.now();
     }
   }
 
@@ -2093,6 +2455,7 @@ class SyncSettingTab extends PluginSettingTab {
       .addDropdown((dropdown) =>
         dropdown
           .addOption("merge", "自动合并")
+          .addOption("last_write_wins", "最后操作优先")
           .addOption("conflict_copy", "创建冲突副本")
           .setValue(this.plugin.settings.sync.conflictStrategy)
           .onChange(async (value) => {

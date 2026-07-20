@@ -20,6 +20,8 @@ export interface IndexedFileState {
   mtimeMs?: number;
   ctimeMs?: number;
   operationTimeMs?: number;
+  /** 该远端版本是否曾在本地真实落盘；远端快照条目必须为 false。 */
+  materialized?: boolean;
 }
 
 export interface LocalDeleteMarker {
@@ -118,7 +120,7 @@ export class LocalStateStore {
     this.state = {
       checkpoint: initialState.checkpoint,
       queue: initialState.queue.map((item) => ({ ...item })),
-      fileIndexByPath: { ...initialState.fileIndexByPath },
+      fileIndexByPath: normalizeFileIndexByPath(initialState.fileIndexByPath),
       localDeleteMarkers: normalizeLocalDeleteMarkers(initialState.localDeleteMarkers),
       failure: {
         failedQueue: initialState.failure.failedQueue.map((item) => ({ ...item })),
@@ -209,6 +211,69 @@ export class LocalStateStore {
     await this.flush();
   }
 
+  async removeLocalDeleteMarker(path: string, expected?: Partial<LocalDeleteMarker>): Promise<void> {
+    const current = this.state.localDeleteMarkers[path];
+    if (!current || (expected && !matchesDeleteMarker(current, expected))) {
+      return;
+    }
+    delete this.state.localDeleteMarkers[path];
+    await this.flush();
+  }
+
+  async updateLocalDeleteMarkerBaseVersion(
+    path: string,
+    expected: LocalDeleteMarker,
+    baseVersion: number
+  ): Promise<void> {
+    const current = this.state.localDeleteMarkers[path];
+    if (!current || !matchesDeleteMarker(current, expected)) {
+      return;
+    }
+    this.state.localDeleteMarkers[path] = { ...current, baseVersion };
+    await this.flush();
+  }
+
+  async rebaseLocalDeleteMarker(
+    expected: LocalDeleteMarker,
+    path: string,
+    fileId: string,
+    baseVersion: number
+  ): Promise<void> {
+    const current = this.state.localDeleteMarkers[expected.path];
+    if (!current || !matchesDeleteMarker(current, expected)) {
+      return;
+    }
+    delete this.state.localDeleteMarkers[expected.path];
+    this.state.localDeleteMarkers[path] = {
+      fileId,
+      path,
+      baseVersion,
+      ts: current.ts
+    };
+    await this.flush();
+  }
+
+  async clearConfirmedDeleteMarkers(
+    deletes: Array<{ path: string; fileId?: string; baseVersion?: number; operationTimeMs: number }>
+  ): Promise<void> {
+    let changed = false;
+    for (const item of deletes) {
+      const marker = this.state.localDeleteMarkers[item.path];
+      if (
+        marker &&
+        marker.fileId === item.fileId &&
+        marker.baseVersion === item.baseVersion &&
+        marker.ts === item.operationTimeMs
+      ) {
+        delete this.state.localDeleteMarkers[item.path];
+        changed = true;
+      }
+    }
+    if (changed) {
+      await this.flush();
+    }
+  }
+
   getFailureState(): SyncFailureState {
     return {
       failedQueue: this.state.failure.failedQueue.map((item) => ({ ...item })),
@@ -266,6 +331,46 @@ export class LocalStateStore {
   private async flush(): Promise<void> {
     await this.onChange(this.getSnapshot());
   }
+}
+
+function matchesDeleteMarker(current: LocalDeleteMarker, expected: Partial<LocalDeleteMarker>): boolean {
+  return (
+    (expected.fileId === undefined || current.fileId === expected.fileId) &&
+    (expected.path === undefined || current.path === expected.path) &&
+    (expected.baseVersion === undefined || current.baseVersion === expected.baseVersion) &&
+    (expected.ts === undefined || current.ts === expected.ts)
+  );
+}
+
+function normalizeFileIndexByPath(raw: unknown): Record<string, IndexedFileState> {
+  if (!raw || typeof raw !== "object") {
+    return {};
+  }
+  const result: Record<string, IndexedFileState> = {};
+  for (const [path, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const entry = value as Partial<IndexedFileState>;
+    if (
+      typeof entry.fileId !== "string" ||
+      typeof entry.path !== "string" ||
+      entry.path !== path ||
+      typeof entry.version !== "number" ||
+      typeof entry.contentHash !== "string"
+    ) {
+      continue;
+    }
+    result[path] = {
+      fileId: entry.fileId,
+      path,
+      version: entry.version,
+      contentHash: entry.contentHash,
+      ...(typeof entry.mtimeMs === "number" ? { mtimeMs: entry.mtimeMs } : {}),
+      ...(typeof entry.ctimeMs === "number" ? { ctimeMs: entry.ctimeMs } : {}),
+      ...(typeof entry.operationTimeMs === "number" ? { operationTimeMs: entry.operationTimeMs } : {}),
+      materialized: entry.materialized === true
+    };
+  }
+  return result;
 }
 
 function normalizeLocalDeleteMarkers(raw: unknown): Record<string, LocalDeleteMarker> {

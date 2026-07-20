@@ -11,7 +11,7 @@ export interface LocalFileSnapshot {
 }
 
 export interface LocalSyncPlan {
-  source: "fresh" | "replay";
+  source: "fresh" | "replay" | "mixed";
   changes: SyncChangeRequest[];
   queuePreview: QueuedChange[];
   hashToSnapshot: Record<string, LocalFileSnapshot>;
@@ -49,14 +49,29 @@ export function buildLocalPlan(
   fileIndexByPath: Record<string, IndexedFileState>,
   options?: PlannerOptions
 ): LocalSyncPlan {
-  if (failedQueue.length > 0) {
-    const replayPlan = planReplayChanges(failedQueue, localSnapshots, fileIndexByPath);
-    if (replayPlan.changes.length > 0) {
-      return replayPlan;
-    }
+  const freshPlan = planLocalChanges(localSnapshots, fileIndexByPath, options);
+  if (failedQueue.length === 0) return freshPlan;
+
+  const replayPlan = planReplayChanges(failedQueue, localSnapshots, fileIndexByPath);
+  if (replayPlan.changes.length === 0) {
+    return { ...freshPlan, droppedFailedItems: replayPlan.droppedFailedItems };
   }
 
-  return planLocalChanges(localSnapshots, fileIndexByPath, options);
+  const replayKeys = new Set(replayPlan.changes.map(changeIdentity));
+  const freshIndexes = freshPlan.changes
+    .map((change, index) => ({ change, index }))
+    .filter(({ change }) => !replayKeys.has(changeIdentity(change)))
+    .map(({ index }) => index);
+  const freshChanges = freshIndexes.map((index) => freshPlan.changes[index]!).filter(Boolean);
+  const freshQueue = freshIndexes.map((index) => freshPlan.queuePreview[index]!).filter(Boolean);
+
+  return {
+    source: freshChanges.length > 0 ? "mixed" : "replay",
+    changes: [...replayPlan.changes, ...freshChanges],
+    queuePreview: [...replayPlan.queuePreview, ...freshQueue],
+    hashToSnapshot: { ...freshPlan.hashToSnapshot, ...replayPlan.hashToSnapshot },
+    droppedFailedItems: replayPlan.droppedFailedItems
+  };
 }
 
 export function planReplayChanges(
@@ -116,6 +131,7 @@ export function planLocalChanges(
   options?: PlannerOptions
 ): LocalSyncPlan {
   const runtimeOptions = resolveOptions(options);
+  const planningTimeMs = runtimeOptions.now();
   const changes: SyncChangeRequest[] = [];
   const queuePreview: QueuedChange[] = [];
   const hashToSnapshot: Record<string, LocalFileSnapshot> = {};
@@ -129,6 +145,7 @@ export function planLocalChanges(
     const indexed = fileIndexByPath[path];
     if (!indexed) continue;
     const list = removedByHash[indexed.contentHash] ?? [];
+    // 同哈希的新旧路径仍可识别为 rename/move；materialized 只约束“缺失即删除”。
     list.push(indexed);
     removedByHash[indexed.contentHash] = list;
   }
@@ -146,7 +163,7 @@ export function planLocalChanges(
           fileId: matched.fileId,
           path: snapshot.path,
           baseVersion: matched.version,
-          operationTimeMs: toServerOperationTime(snapshot.mtimeMs, runtimeOptions),
+          operationTimeMs: toServerOperationTime(planningTimeMs, runtimeOptions),
           mtimeMs: snapshot.mtimeMs,
           ...(snapshot.ctimeMs === undefined ? {} : { ctimeMs: snapshot.ctimeMs })
         };
@@ -194,13 +211,19 @@ export function planLocalChanges(
     const indexed = fileIndexByPath[path];
     if (!indexed) continue;
     const deleteMarker = runtimeOptions.deleteMarkers[path];
-    if (!deleteMarker || deleteMarker.fileId !== indexed.fileId) {
-      continue;
-    }
-    if (
+    const markerMatchesCurrentVersion = Boolean(
+      deleteMarker &&
+      deleteMarker.fileId === indexed.fileId &&
+      deleteMarker.baseVersion === indexed.version
+    );
+    const markerWinsNewerRemoteVersion = Boolean(
+      deleteMarker &&
+      deleteMarker.fileId === indexed.fileId &&
       deleteMarker.baseVersion !== indexed.version &&
-      !isLocalDeleteNewerThanIndexedFile(deleteMarker, indexed, runtimeOptions)
-    ) {
+      isLocalDeleteNewerThanIndexedFile(deleteMarker, indexed, runtimeOptions)
+    );
+    const hasMatchingMarker = markerMatchesCurrentVersion || markerWinsNewerRemoteVersion;
+    if (!hasMatchingMarker && indexed.materialized !== true) {
       continue;
     }
     const change: SyncChangeRequest = {
@@ -208,8 +231,10 @@ export function planLocalChanges(
       fileId: indexed.fileId,
       path: indexed.path,
       baseVersion: indexed.version,
-      operationTimeMs: toServerOperationTime(deleteMarker.ts, runtimeOptions),
-      mtimeMs: deleteMarker.ts
+      operationTimeMs: toServerOperationTime(
+        hasMatchingMarker ? deleteMarker!.ts : planningTimeMs,
+        runtimeOptions
+      )
     };
     changes.push(change);
     queuePreview.push(toQueuedChange(change, runtimeOptions));
@@ -235,7 +260,7 @@ export function toSyncChangeRequest(change: QueuedChange): SyncChangeRequest | n
         op: "create",
         path: change.path,
         contentHash: change.contentHash,
-        operationTimeMs: change.operationTimeMs,
+        operationTimeMs: queuedOperationTime(change),
         mtimeMs: change.mtimeMs,
         ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
       };
@@ -249,7 +274,7 @@ export function toSyncChangeRequest(change: QueuedChange): SyncChangeRequest | n
         path: change.path,
         baseVersion: change.baseVersion,
         contentHash: change.contentHash,
-        operationTimeMs: change.operationTimeMs,
+        operationTimeMs: queuedOperationTime(change),
         mtimeMs: change.mtimeMs,
         ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
       };
@@ -262,7 +287,7 @@ export function toSyncChangeRequest(change: QueuedChange): SyncChangeRequest | n
         fileId: change.fileId,
         path: change.path,
         baseVersion: change.baseVersion,
-        operationTimeMs: change.operationTimeMs,
+        operationTimeMs: queuedOperationTime(change),
         mtimeMs: change.mtimeMs,
         ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
       };
@@ -276,7 +301,7 @@ export function toSyncChangeRequest(change: QueuedChange): SyncChangeRequest | n
         fileId: change.fileId,
         path: change.path,
         baseVersion: change.baseVersion,
-        operationTimeMs: change.operationTimeMs,
+        operationTimeMs: queuedOperationTime(change),
         mtimeMs: change.mtimeMs,
         ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
       };
@@ -368,10 +393,12 @@ export function normalizeQueuedChanges(rawQueue: unknown, options?: PlannerOptio
     const mtimeMs = typeof rawMtimeMs === "number" && Number.isFinite(rawMtimeMs) ? rawMtimeMs : undefined;
     const rawCtimeMs = raw.ctimeMs;
     const ctimeMs = typeof rawCtimeMs === "number" && Number.isFinite(rawCtimeMs) ? rawCtimeMs : undefined;
+    const ts = typeof raw.ts === "number" && Number.isFinite(raw.ts) ? raw.ts : runtimeOptions.now();
     const rawOperationTimeMs = raw.operationTimeMs;
     const operationTimeMs =
-      typeof rawOperationTimeMs === "number" && Number.isFinite(rawOperationTimeMs) ? rawOperationTimeMs : undefined;
-    const ts = typeof raw.ts === "number" && Number.isFinite(raw.ts) ? raw.ts : runtimeOptions.now();
+      typeof rawOperationTimeMs === "number" && Number.isFinite(rawOperationTimeMs)
+        ? rawOperationTimeMs
+        : mtimeMs ?? ts;
 
     result.push({
       id,
@@ -380,7 +407,7 @@ export function normalizeQueuedChanges(rawQueue: unknown, options?: PlannerOptio
       fileId,
       baseVersion,
       contentHash,
-      ...(operationTimeMs === undefined ? {} : { operationTimeMs }),
+      operationTimeMs,
       ...(mtimeMs === undefined ? {} : { mtimeMs }),
       ...(ctimeMs === undefined ? {} : { ctimeMs }),
       attempts,
@@ -424,12 +451,42 @@ function toQueuedChange(change: SyncChangeRequest, options: PlannerRuntimeOption
     fileId: change.fileId,
     baseVersion: change.baseVersion,
     contentHash: change.contentHash,
-    ...(change.operationTimeMs === undefined ? {} : { operationTimeMs: change.operationTimeMs }),
+    operationTimeMs: change.operationTimeMs,
     ...(change.mtimeMs === undefined ? {} : { mtimeMs: change.mtimeMs }),
     ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs }),
     attempts,
     ts: options.now()
   };
+}
+
+function changeIdentity(change: SyncChangeRequest): string {
+  return [
+    change.op,
+    change.fileId ?? "-",
+    change.path,
+    change.baseVersion ?? "-",
+    change.contentHash ?? "-"
+  ].join(":");
+}
+
+function queuedOperationTime(change: QueuedChange): number {
+  return change.operationTimeMs ?? change.mtimeMs ?? change.ts;
+}
+
+export function markLocalSnapshotsMaterialized(
+  fileIndexByPath: Record<string, IndexedFileState>,
+  localSnapshots: Record<string, LocalFileSnapshot>
+): Record<string, IndexedFileState> {
+  let changed = false;
+  const result = { ...fileIndexByPath };
+  for (const path of Object.keys(localSnapshots)) {
+    const indexed = result[path];
+    if (indexed && indexed.materialized !== true) {
+      result[path] = { ...indexed, materialized: true };
+      changed = true;
+    }
+  }
+  return changed ? result : fileIndexByPath;
 }
 
 function resolveOptions(options?: PlannerOptions): PlannerRuntimeOptions {

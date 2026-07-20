@@ -32,7 +32,7 @@ export interface SyncChangeRequest {
   contentHash?: string;
   mtimeMs?: number;
   ctimeMs?: number;
-  operationTimeMs?: number;
+  operationTimeMs: number;
 }
 
 export interface SyncConflict {
@@ -77,7 +77,7 @@ export interface SyncPullChange {
   contentHash: string;
   mtimeMs?: number;
   ctimeMs?: number;
-  operationTimeMs?: number;
+  operationTimeMs: number;
 }
 
 export interface SyncPullResponse {
@@ -85,6 +85,22 @@ export interface SyncPullResponse {
   toCheckpoint: string;
   changes: SyncPullChange[];
   hasMore: boolean;
+}
+
+export interface SyncSnapshotFile {
+  fileId: string;
+  path: string;
+  version: number;
+  contentHash: string;
+  mtimeMs?: number;
+  ctimeMs?: number;
+  operationTimeMs: number;
+}
+
+export interface SyncSnapshotResponse {
+  checkpoint: string;
+  files: SyncSnapshotFile[];
+  deletedFiles: SyncSnapshotFile[];
 }
 
 export interface DownloadUrlItem {
@@ -214,6 +230,20 @@ export class SyncApiClient {
       },
       signal
     );
+  }
+
+  async snapshot(
+    accessToken: string,
+    vaultId: string,
+    signal?: AbortSignal
+  ): Promise<SyncSnapshotResponse> {
+    return this.request<SyncSnapshotResponse>(`/vaults/${vaultId}/sync/snapshot`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${accessToken}`
+      },
+      signal
+    }, signal);
   }
 
   async getFileVersionDownloadUrl(

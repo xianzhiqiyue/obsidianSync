@@ -52,7 +52,9 @@ export function applyRemoteChangesToIndex(
       contentHash: change.contentHash,
       ...(change.operationTimeMs === undefined ? {} : { operationTimeMs: change.operationTimeMs }),
       ...(change.mtimeMs === undefined ? {} : { mtimeMs: change.mtimeMs }),
-      ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs })
+      ...(change.ctimeMs === undefined ? {} : { ctimeMs: change.ctimeMs }),
+      operationTimeMs: change.operationTimeMs,
+      materialized: false
     };
     pathByFileId[change.fileId] = change.path;
   }

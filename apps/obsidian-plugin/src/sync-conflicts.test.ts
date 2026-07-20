@@ -35,14 +35,16 @@ test("pruneMissingFileIndexEntries removes stale file ids reported by prepare co
       fileId: "11111111-1111-1111-1111-111111111111",
       path: "notes/a.md",
       baseVersion: 2,
-      contentHash: "sha256:a-new"
+      contentHash: "sha256:a-new",
+      operationTimeMs: 10
     },
     {
       op: "update",
       fileId: "22222222-2222-2222-2222-222222222222",
       path: "notes/a.conflict-ubuntu-device-1.md",
       baseVersion: 1,
-      contentHash: "sha256:conflict-new"
+      contentHash: "sha256:conflict-new",
+      operationTimeMs: 10
     }
   ];
   const conflicts: SyncConflict[] = [
@@ -74,20 +76,23 @@ test("collectLocalDeletionPaths keeps local delete intent for conflicted files",
       op: "delete",
       fileId: "11111111-1111-1111-1111-111111111111",
       path: "notes/a.md",
-      baseVersion: 2
+      baseVersion: 2,
+      operationTimeMs: 10
     },
     {
       op: "update",
       fileId: "22222222-2222-2222-2222-222222222222",
       path: "notes/b.md",
       baseVersion: 1,
-      contentHash: "sha256:new"
+      contentHash: "sha256:new",
+      operationTimeMs: 10
     },
     {
       op: "delete",
       fileId: "33333333-3333-3333-3333-333333333333",
       path: "notes/c.md",
-      baseVersion: 4
+      baseVersion: 4,
+      operationTimeMs: 10
     }
   ];
   const conflicts: SyncConflict[] = [
@@ -123,13 +128,15 @@ test("areAllConflictsLocalDeletes only returns true for pure delete conflicts", 
       op: "delete",
       fileId: "11111111-1111-1111-1111-111111111111",
       path: "notes/a.md",
-      baseVersion: 2
+      baseVersion: 2,
+      operationTimeMs: 10
     },
     {
       op: "delete",
       fileId: "22222222-2222-2222-2222-222222222222",
       path: "notes/b.md",
-      baseVersion: 5
+      baseVersion: 5,
+      operationTimeMs: 10
     }
   ];
   const deleteOnlyConflicts: SyncConflict[] = [
@@ -153,7 +160,8 @@ test("areAllConflictsLocalDeletes only returns true for pure delete conflicts", 
       fileId: "33333333-3333-3333-3333-333333333333",
       path: "notes/c.md",
       baseVersion: 1,
-      contentHash: "sha256:new"
+      contentHash: "sha256:new",
+      operationTimeMs: 10
     }
   ];
   const mixedConflicts: SyncConflict[] = [

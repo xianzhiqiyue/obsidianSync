@@ -118,3 +118,54 @@ test("local delete markers can be stored and cleared", async () => {
   await store.clearLocalDeleteMarkers();
   assert.deepEqual(store.getLocalDeleteMarkers(), {});
 });
+
+test("confirmed delete only clears the exact marker sent by this sync", async () => {
+  const store = createStore();
+  await store.markLocalDelete({
+    fileId: "11111111-1111-1111-1111-111111111111",
+    path: "notes/a.md",
+    baseVersion: 3,
+    ts: 100
+  });
+  await store.markLocalDelete({
+    fileId: "11111111-1111-1111-1111-111111111111",
+    path: "notes/a.md",
+    baseVersion: 3,
+    ts: 200
+  });
+
+  await store.clearConfirmedDeleteMarkers([
+    {
+      fileId: "11111111-1111-1111-1111-111111111111",
+      path: "notes/a.md",
+      baseVersion: 3,
+      operationTimeMs: 100
+    }
+  ]);
+
+  assert.equal(store.getLocalDeleteMarkers()["notes/a.md"]?.ts, 200);
+});
+
+test("rebasing a delete marker preserves its operation time", async () => {
+  const store = createStore();
+  const original = {
+    fileId: "11111111-1111-1111-1111-111111111111",
+    path: "notes/a.md",
+    baseVersion: 3,
+    ts: 123
+  };
+  await store.markLocalDelete(original);
+  await store.rebaseLocalDeleteMarker(
+    original,
+    "archive/a.md",
+    "11111111-1111-1111-1111-111111111111",
+    4
+  );
+
+  assert.equal(store.getLocalDeleteMarkers()["notes/a.md"], undefined);
+  assert.deepEqual(store.getLocalDeleteMarkers()["archive/a.md"], {
+    ...original,
+    path: "archive/a.md",
+    baseVersion: 4
+  });
+});
