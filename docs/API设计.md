@@ -197,7 +197,8 @@
       "fileId": "550e8400-e29b-41d4-a716-446655440001",
       "path": "notes/a.md",
       "baseVersion": 3,
-      "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "operationTimeMs": 1771396800000
     }
   ]
 }
@@ -220,6 +221,8 @@
 说明：
 - 仅返回“服务端缺失对象”的上传地址。
 - 若存在版本冲突，`conflicts` 返回冲突项，客户端不得继续 commit。
+- `operationTimeMs` 表示用户操作时间，create/update/delete/rename/move 均必须携带；兼容旧客户端时服务端会填充接收时间。
+- create 会同时检查活动路径和有效 tombstone；时间早于或等于墓碑时返回 `PATH_TOMBSTONE_CONFLICT`。
 
 ### 4.3 提交变更
 - `POST /vaults/{vaultId}/sync/commit`
@@ -255,14 +258,49 @@
       "fileId": "550e8400-e29b-41d4-a716-446655440001",
       "path": "notes/a.md",
       "version": 4,
-      "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "operationTimeMs": 1771396800000
     }
   ],
   "hasMore": false
 }
 ```
 
-### 4.5 获取下载地址
+说明：
+- `limit` 用于选择最后一个完整 checkpoint；若单个 changeset 超过 limit，响应会完整返回该 checkpoint，不会截断事件。
+- 同一 checkpoint 内按服务端 `event_index` 稳定排序。
+
+### 4.5 获取活动文件快照
+- `GET /vaults/{vaultId}/sync/snapshot`
+
+响应：
+```json
+{
+  "checkpoint": "cp_1025",
+  "files": [
+    {
+      "fileId": "550e8400-e29b-41d4-a716-446655440001",
+      "path": "notes/a.md",
+      "version": 4,
+      "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "operationTimeMs": 1771396800000
+    }
+  ],
+  "deletedFiles": [
+    {
+      "fileId": "550e8400-e29b-41d4-a716-446655440099",
+      "path": "notes/deleted.md",
+      "version": 2,
+      "contentHash": "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      "operationTimeMs": 1771396700000
+    }
+  ]
+}
+```
+
+`files` 返回活动文件，`deletedFiles` 返回持久删除证据；两者与 checkpoint 处于同一个一致性边界。
+
+### 4.6 获取下载地址
 - `POST /vaults/{vaultId}/objects/download-urls`
 
 请求：
@@ -457,6 +495,9 @@
 | 403 | `DEVICE_REVOKED` | 设备被撤销 | 中止同步并提示重新登录 |
 | 404 | `VAULT_NOT_FOUND` | Vault 不存在或无权限 | 中止并提示 |
 | 409 | `VERSION_CONFLICT` | base_version 不匹配 | 走冲突流程 |
+| 409 | `PATH_CONFLICT` | 目标路径已被活动文件占用 | 按操作时间决胜或进入待决 |
+| 409 | `PATH_TOMBSTONE_CONFLICT` | create 不晚于有效删除墓碑 | 保留较新的删除或重新规划 |
+| 409 | `FILE_NOT_FOUND` | 文件已被其他提交删除 | 拉取最新状态后重新规划 |
 | 409 | `CHECKPOINT_MISMATCH` | checkpoint 过旧或不连续 | 重拉状态并重试 |
 | 429 | `RATE_LIMITED` | 请求过快 | 指数退避重试 |
 | 409 | `ADMIN_PATH_CONFLICT` | 管理操作目标路径冲突 | 重新选择路径或取消操作 |
