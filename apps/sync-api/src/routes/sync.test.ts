@@ -132,6 +132,32 @@ async function cleanupObjectHashes(contentHashes: string[]): Promise<void> {
   await query("DELETE FROM object_blobs WHERE content_hash = ANY($1::text[])", [contentHashes]);
 }
 
+async function prepareChanges(
+  context: TestContext,
+  baseCheckpoint: number,
+  changes: Array<Record<string, unknown>>
+): Promise<PrepareResponse> {
+  const response = await context.app.inject({
+    method: "POST",
+    url: `/api/v1/vaults/${context.vaultId}/sync/prepare`,
+    headers: { authorization: `Bearer ${context.accessToken}` },
+    payload: { baseCheckpoint, changes }
+  });
+  assert.equal(response.statusCode, 200);
+  return response.json() as PrepareResponse;
+}
+
+async function commitPrepare(context: TestContext, prepareId: string): Promise<CommitResponse> {
+  const response = await context.app.inject({
+    method: "POST",
+    url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+    headers: { authorization: `Bearer ${context.accessToken}` },
+    payload: { prepareId, idempotencyKey: randomUUID() }
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  return response.json() as CommitResponse;
+}
+
 test("sync commit should be idempotent for same idempotency key", async () => {
   const contentHash = testContentHash("idempotent");
   const existingHashes = new Set([contentHash]);
@@ -869,6 +895,407 @@ test("sync commit should fail when uploaded object is missing", async () => {
   } finally {
     await destroyTestContext(context);
     await cleanupObjectHashes([missingHash]);
+  }
+});
+
+test("delete commit should persist tombstone and only allow a newer create", async () => {
+  const originalHash = testContentHash("tombstone-original");
+  const recreatedHash = testContentHash("tombstone-recreated");
+  const existingHashes = new Set([originalHash, recreatedHash]);
+  const context = await createTestContext(existingHashes);
+  try {
+    const path = `notes/tombstone-${randomUUID()}.md`;
+    const createPrepare = await prepareChanges(context, 0, [
+      { op: "create", path, contentHash: originalHash, operationTimeMs: 1000 }
+    ]);
+    await commitPrepare(context, createPrepare.prepareId);
+
+    const fileResult = await query<{ id: string }>(
+      "SELECT id FROM file_entries WHERE vault_id = $1 AND current_path = $2 AND deleted_at IS NULL",
+      [context.vaultId, path]
+    );
+    const deletedFileId = fileResult.rows[0]?.id;
+    assert.ok(deletedFileId);
+
+    const deletePrepare = await prepareChanges(context, 1, [
+      {
+        op: "delete",
+        fileId: deletedFileId,
+        path,
+        baseVersion: 1,
+        operationTimeMs: 3000
+      }
+    ]);
+    const deleteCommit = await commitPrepare(context, deletePrepare.prepareId);
+    assert.equal(deleteCommit.newCheckpoint, "cp_2");
+
+    const tombstoneResult = await query<{
+      path: string;
+      operation_time_ms: string;
+      deleted_file: boolean;
+    }>(
+      `SELECT tombstone.path,
+              tombstone.operation_time_ms,
+              file_entry.deleted_at IS NOT NULL AS deleted_file
+       FROM tombstones AS tombstone
+       JOIN file_entries AS file_entry ON file_entry.id = tombstone.file_id
+       WHERE tombstone.vault_id = $1 AND tombstone.file_id = $2`,
+      [context.vaultId, deletedFileId]
+    );
+    assert.equal(tombstoneResult.rows[0]?.path, path);
+    assert.equal(Number(tombstoneResult.rows[0]?.operation_time_ms), 3000);
+    assert.equal(tombstoneResult.rows[0]?.deleted_file, true);
+
+    const deletePull = await context.app.inject({
+      method: "GET",
+      url: `/api/v1/vaults/${context.vaultId}/sync/pull?fromCheckpoint=1`,
+      headers: { authorization: `Bearer ${context.accessToken}` }
+    });
+    assert.equal(deletePull.statusCode, 200);
+    assert.equal(deletePull.json().changes[0]?.op, "delete");
+    assert.equal(deletePull.json().changes[0]?.operationTimeMs, 3000);
+
+    for (const operationTimeMs of [undefined, 2999, 3000]) {
+      const staleCreate: Record<string, unknown> = {
+        op: "create",
+        path,
+        contentHash: recreatedHash
+      };
+      if (operationTimeMs !== undefined) {
+        staleCreate.operationTimeMs = operationTimeMs;
+      }
+      const stalePrepare = await prepareChanges(context, 2, [staleCreate]);
+      assert.equal(stalePrepare.conflicts[0]?.code, "PATH_TOMBSTONE_CONFLICT");
+      assert.equal(stalePrepare.conflicts[0]?.remoteOperationTimeMs, 3000);
+    }
+
+    const recreatePrepare = await prepareChanges(context, 2, [
+      { op: "create", path, contentHash: recreatedHash, operationTimeMs: 3001 }
+    ]);
+    assert.deepEqual(recreatePrepare.conflicts, []);
+    const recreateCommit = await commitPrepare(context, recreatePrepare.prepareId);
+    assert.equal(recreateCommit.newCheckpoint, "cp_3");
+
+    const recreatedFileResult = await query<{ id: string }>(
+      "SELECT id FROM file_entries WHERE vault_id = $1 AND current_path = $2 AND deleted_at IS NULL",
+      [context.vaultId, path]
+    );
+    assert.ok(recreatedFileResult.rows[0]?.id);
+    assert.notEqual(recreatedFileResult.rows[0]?.id, deletedFileId);
+  } finally {
+    await destroyTestContext(context);
+    await cleanupObjectHashes([originalHash, recreatedHash]);
+  }
+});
+
+test("prepare should reject an operation that is not newer than the remote head", async () => {
+  const remoteHash = testContentHash("lww-remote-head");
+  const staleHash = testContentHash("lww-stale-update");
+  const context = await createTestContext(new Set([remoteHash, staleHash]));
+  try {
+    const path = `notes/lww-${randomUUID()}.md`;
+    const createPrepare = await prepareChanges(context, 0, [
+      { op: "create", path, contentHash: remoteHash, operationTimeMs: 3000 }
+    ]);
+    await commitPrepare(context, createPrepare.prepareId);
+    const fileResult = await query<{ id: string }>(
+      "SELECT id FROM file_entries WHERE vault_id = $1 AND current_path = $2 AND deleted_at IS NULL",
+      [context.vaultId, path]
+    );
+    const fileId = fileResult.rows[0]?.id;
+    assert.ok(fileId);
+
+    for (const operationTimeMs of [2999, 3000]) {
+      const stalePrepare = await prepareChanges(context, 1, [
+        {
+          op: "update",
+          fileId,
+          path,
+          baseVersion: 1,
+          contentHash: staleHash,
+          operationTimeMs
+        }
+      ]);
+      assert.equal(stalePrepare.conflicts[0]?.code, "VERSION_CONFLICT");
+      assert.equal(stalePrepare.conflicts[0]?.reason, "stale_operation_time");
+      assert.equal(stalePrepare.conflicts[0]?.remoteOperationTimeMs, 3000);
+    }
+
+    const newerPrepare = await prepareChanges(context, 1, [
+      {
+        op: "update",
+        fileId,
+        path,
+        baseVersion: 1,
+        contentHash: staleHash,
+        operationTimeMs: 3001
+      }
+    ]);
+    assert.deepEqual(newerPrepare.conflicts, []);
+
+    const wrongPathPrepare = await prepareChanges(context, 1, [
+      {
+        op: "update",
+        fileId,
+        path: `${path}.moved`,
+        baseVersion: 1,
+        contentHash: staleHash,
+        operationTimeMs: 4000
+      }
+    ]);
+    assert.equal(wrongPathPrepare.conflicts[0]?.code, "VERSION_CONFLICT");
+    assert.equal(wrongPathPrepare.conflicts[0]?.reason, "remote_path_mismatch");
+    assert.equal(wrongPathPrepare.conflicts[0]?.remotePath, path);
+  } finally {
+    await destroyTestContext(context);
+    await cleanupObjectHashes([remoteHash, staleHash]);
+  }
+});
+
+test("create commit should recheck a tombstone created after prepare", async () => {
+  const staleHash = testContentHash("commit-stale-create");
+  const temporaryHash = testContentHash("commit-temporary-create");
+  const existingHashes = new Set([staleHash, temporaryHash]);
+  const context = await createTestContext(existingHashes);
+  try {
+    const path = `notes/commit-race-${randomUUID()}.md`;
+    const stalePrepare = await prepareChanges(context, 0, [
+      { op: "create", path, contentHash: staleHash, operationTimeMs: 1000 }
+    ]);
+    const temporaryPrepare = await prepareChanges(context, 0, [
+      { op: "create", path, contentHash: temporaryHash, operationTimeMs: 2000 }
+    ]);
+    await commitPrepare(context, temporaryPrepare.prepareId);
+
+    const fileResult = await query<{ id: string }>(
+      "SELECT id FROM file_entries WHERE vault_id = $1 AND current_path = $2 AND deleted_at IS NULL",
+      [context.vaultId, path]
+    );
+    const fileId = fileResult.rows[0]?.id;
+    assert.ok(fileId);
+    const deletePrepare = await prepareChanges(context, 1, [
+      { op: "delete", fileId, path, baseVersion: 1, operationTimeMs: 3000 }
+    ]);
+    await commitPrepare(context, deletePrepare.prepareId);
+
+    const staleCommit = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: { prepareId: stalePrepare.prepareId, idempotencyKey: randomUUID() }
+    });
+    assert.equal(staleCommit.statusCode, 409);
+    assert.equal(staleCommit.json().code, "PATH_TOMBSTONE_CONFLICT");
+    assert.equal(staleCommit.json().remoteOperationTimeMs, 3000);
+  } finally {
+    await destroyTestContext(context);
+    await cleanupObjectHashes([staleHash, temporaryHash]);
+  }
+});
+
+test("commit should return structured conflicts when prepared state becomes stale", async () => {
+  const originalHash = testContentHash("commit-race-original");
+  const staleHash = testContentHash("commit-race-stale");
+  const winnerHash = testContentHash("commit-race-winner");
+  const context = await createTestContext(new Set([originalHash, staleHash, winnerHash]));
+  try {
+    const path = `notes/version-race-${randomUUID()}.md`;
+    const createPrepare = await prepareChanges(context, 0, [
+      { op: "create", path, contentHash: originalHash, operationTimeMs: 1000 }
+    ]);
+    await commitPrepare(context, createPrepare.prepareId);
+    const fileResult = await query<{ id: string }>(
+      "SELECT id FROM file_entries WHERE vault_id = $1 AND current_path = $2 AND deleted_at IS NULL",
+      [context.vaultId, path]
+    );
+    const fileId = fileResult.rows[0]?.id;
+    assert.ok(fileId);
+
+    const stalePrepare = await prepareChanges(context, 1, [
+      { op: "update", fileId, path, baseVersion: 1, contentHash: staleHash, operationTimeMs: 2000 }
+    ]);
+    const winnerPrepare = await prepareChanges(context, 1, [
+      { op: "update", fileId, path, baseVersion: 1, contentHash: winnerHash, operationTimeMs: 3000 }
+    ]);
+    await commitPrepare(context, winnerPrepare.prepareId);
+
+    const staleCommit = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: { prepareId: stalePrepare.prepareId, idempotencyKey: randomUUID() }
+    });
+    assert.equal(staleCommit.statusCode, 409);
+    assert.equal(staleCommit.json().code, "VERSION_CONFLICT");
+    assert.equal(staleCommit.json().headVersion, 2);
+    assert.equal(staleCommit.json().remoteContentHash, winnerHash);
+    assert.equal(staleCommit.json().remoteOperationTimeMs, 3000);
+  } finally {
+    await destroyTestContext(context);
+    await cleanupObjectHashes([originalHash, staleHash, winnerHash]);
+  }
+});
+
+test("create commit should return PATH_CONFLICT when another commit occupies the path", async () => {
+  const staleHash = testContentHash("path-race-stale");
+  const winnerHash = testContentHash("path-race-winner");
+  const context = await createTestContext(new Set([staleHash, winnerHash]));
+  try {
+    const path = `notes/path-race-${randomUUID()}.md`;
+    const stalePrepare = await prepareChanges(context, 0, [
+      { op: "create", path, contentHash: staleHash, operationTimeMs: 1000 }
+    ]);
+    const winnerPrepare = await prepareChanges(context, 0, [
+      { op: "create", path, contentHash: winnerHash, operationTimeMs: 2000 }
+    ]);
+    await commitPrepare(context, winnerPrepare.prepareId);
+
+    const staleCommit = await context.app.inject({
+      method: "POST",
+      url: `/api/v1/vaults/${context.vaultId}/sync/commit`,
+      headers: { authorization: `Bearer ${context.accessToken}` },
+      payload: { prepareId: stalePrepare.prepareId, idempotencyKey: randomUUID() }
+    });
+    assert.equal(staleCommit.statusCode, 409);
+    assert.equal(staleCommit.json().code, "PATH_CONFLICT");
+    assert.equal(staleCommit.json().path, path);
+  } finally {
+    await destroyTestContext(context);
+    await cleanupObjectHashes([staleHash, winnerHash]);
+  }
+});
+
+test("pull should keep a checkpoint intact when it exceeds the requested limit", async () => {
+  const firstHashes = Array.from({ length: 250 }, (_, index) =>
+    testContentHash(`large-checkpoint-${index}-${randomUUID()}`)
+  );
+  const secondHash = testContentHash("after-large-checkpoint");
+  const allHashes = [...firstHashes, secondHash];
+  const context = await createTestContext(new Set(allHashes));
+  try {
+    const firstPrepare = await prepareChanges(
+      context,
+      0,
+      firstHashes.map((contentHash, index) => ({
+        op: "create",
+        path: `bulk/${String(index).padStart(3, "0")}.md`,
+        contentHash,
+        operationTimeMs: 10_000 + index
+      }))
+    );
+    await commitPrepare(context, firstPrepare.prepareId);
+
+    const secondPrepare = await prepareChanges(context, 1, [
+      {
+        op: "create",
+        path: `bulk/after-${randomUUID()}.md`,
+        contentHash: secondHash,
+        operationTimeMs: 20_000
+      }
+    ]);
+    await commitPrepare(context, secondPrepare.prepareId);
+
+    const firstPull = await context.app.inject({
+      method: "GET",
+      url: `/api/v1/vaults/${context.vaultId}/sync/pull?fromCheckpoint=0&limit=200`,
+      headers: { authorization: `Bearer ${context.accessToken}` }
+    });
+    assert.equal(firstPull.statusCode, 200);
+    assert.equal(firstPull.json().changes.length, 250);
+    assert.equal(firstPull.json().toCheckpoint, "cp_1");
+    assert.equal(firstPull.json().hasMore, true);
+    assert.equal(new Set(firstPull.json().changes.map((change: { fileId: string }) => change.fileId)).size, 250);
+
+    const secondPull = await context.app.inject({
+      method: "GET",
+      url: `/api/v1/vaults/${context.vaultId}/sync/pull?fromCheckpoint=1&limit=200`,
+      headers: { authorization: `Bearer ${context.accessToken}` }
+    });
+    assert.equal(secondPull.statusCode, 200);
+    assert.equal(secondPull.json().changes.length, 1);
+    assert.equal(secondPull.json().toCheckpoint, "cp_2");
+    assert.equal(secondPull.json().hasMore, false);
+  } finally {
+    await destroyTestContext(context);
+    await cleanupObjectHashes(allHashes);
+  }
+});
+
+test("sync snapshot should return only active files at one checkpoint", async () => {
+  const deletedHash = testContentHash("snapshot-deleted");
+  const activeHash = testContentHash("snapshot-active");
+  const context = await createTestContext(new Set([deletedHash, activeHash]));
+  try {
+    const deletedPath = `notes/snapshot-deleted-${randomUUID()}.md`;
+    const activePath = `notes/snapshot-active-${randomUUID()}.md`;
+    const createPrepare = await prepareChanges(context, 0, [
+      {
+        op: "create",
+        path: deletedPath,
+        contentHash: deletedHash,
+        mtimeMs: 111,
+        ctimeMs: 112,
+        operationTimeMs: 1000
+      },
+      {
+        op: "create",
+        path: activePath,
+        contentHash: activeHash,
+        mtimeMs: 211,
+        ctimeMs: 212,
+        operationTimeMs: 2000
+      }
+    ]);
+    await commitPrepare(context, createPrepare.prepareId);
+
+    const deletedFileResult = await query<{ id: string }>(
+      "SELECT id FROM file_entries WHERE vault_id = $1 AND current_path = $2 AND deleted_at IS NULL",
+      [context.vaultId, deletedPath]
+    );
+    const deletedFileId = deletedFileResult.rows[0]?.id;
+    assert.ok(deletedFileId);
+    const deletePrepare = await prepareChanges(context, 1, [
+      {
+        op: "delete",
+        fileId: deletedFileId,
+        path: deletedPath,
+        baseVersion: 1,
+        operationTimeMs: 3000
+      }
+    ]);
+    await commitPrepare(context, deletePrepare.prepareId);
+
+    const snapshotResponse = await context.app.inject({
+      method: "GET",
+      url: `/api/v1/vaults/${context.vaultId}/sync/snapshot`,
+      headers: { authorization: `Bearer ${context.accessToken}` }
+    });
+    assert.equal(snapshotResponse.statusCode, 200);
+    assert.equal(snapshotResponse.json().checkpoint, "cp_2");
+    assert.deepEqual(snapshotResponse.json().files, [
+      {
+        fileId: snapshotResponse.json().files[0]?.fileId,
+        path: activePath,
+        version: 1,
+        contentHash: activeHash,
+        mtimeMs: 211,
+        ctimeMs: 212,
+        operationTimeMs: 2000
+      }
+    ]);
+    assert.match(snapshotResponse.json().files[0]?.fileId ?? "", /^[0-9a-f-]{36}$/i);
+    assert.deepEqual(snapshotResponse.json().deletedFiles, [
+      {
+        fileId: deletedFileId,
+        path: deletedPath,
+        version: 2,
+        contentHash: deletedHash,
+        operationTimeMs: 3000
+      }
+    ]);
+  } finally {
+    await destroyTestContext(context);
+    await cleanupObjectHashes([deletedHash, activeHash]);
   }
 });
 

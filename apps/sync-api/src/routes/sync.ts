@@ -23,7 +23,7 @@ const syncChangeSchema = z.object({
   contentHash: contentHashSchema.optional(),
   mtimeMs: z.number().int().nonnegative().optional(),
   ctimeMs: z.number().int().nonnegative().optional(),
-  operationTimeMs: z.number().int().nonnegative().optional()
+  operationTimeMs: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional()
 });
 
 const prepareBodySchema = z.object({
@@ -77,10 +77,26 @@ interface ChangeEventRow {
   content_hash: string;
   mtime_ms: string | null;
   ctime_ms: string | null;
-  operation_time_ms: string | null;
+  operation_time_ms: string;
+  event_index: number;
   source?: string;
   reason?: string | null;
   admin_operation_id?: string | null;
+}
+
+interface TombstoneRow {
+  path: string;
+  operation_time_ms: string;
+}
+
+interface SnapshotFileRow {
+  file_id: string;
+  path: string;
+  version: number;
+  content_hash: string;
+  mtime_ms: string | null;
+  ctime_ms: string | null;
+  operation_time_ms: string;
 }
 
 interface SyncPrepareRow {
@@ -112,6 +128,16 @@ interface ConflictItem {
 interface UploadTarget {
   contentHash: string;
   uploadUrl: string;
+}
+
+class SyncCommitConflict extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly details: Record<string, unknown> = {}
+  ) {
+    super(message);
+  }
 }
 
 async function assertVaultOwnership(vaultId: string, userId: string): Promise<boolean> {
@@ -167,6 +193,20 @@ async function getActiveFileEntryByPath(vaultId: string, path: string, ignoreFil
      WHERE vault_id = $1
        AND current_path = $2
        AND deleted_at IS NULL
+     LIMIT 1`,
+    [vaultId, path]
+  );
+  return result.rows[0] ?? null;
+}
+
+async function getActiveTombstoneByPath(vaultId: string, path: string): Promise<TombstoneRow | null> {
+  const result = await query<TombstoneRow>(
+    `SELECT path, operation_time_ms
+     FROM tombstones
+     WHERE vault_id = $1
+       AND path = $2
+       AND expire_at > NOW()
+     ORDER BY operation_time_ms DESC, deleted_at DESC, id DESC
      LIMIT 1`,
     [vaultId, path]
   );
@@ -340,15 +380,14 @@ async function fetchLatestContentHash(client: { query: typeof query }, fileId: s
 async function fetchLatestVersionMetadata(
   client: { query: typeof query },
   fileId: string
-): Promise<{ contentHash: string; mtimeMs?: number; ctimeMs?: number; operationTimeMs?: number }> {
+): Promise<{ contentHash: string; mtimeMs?: number; ctimeMs?: number; operationTimeMs: number }> {
   const row = await client.query<{
     content_hash: string;
     mtime_ms: string | null;
     ctime_ms: string | null;
-    operation_time_ms: string | null;
-    created_at: Date;
+    operation_time_ms: string;
   }>(
-    `SELECT content_hash, mtime_ms, ctime_ms, operation_time_ms, created_at
+    `SELECT content_hash, mtime_ms, ctime_ms, operation_time_ms
      FROM file_versions
      WHERE file_id = $1
      ORDER BY version DESC
@@ -363,10 +402,7 @@ async function fetchLatestVersionMetadata(
     contentHash: version.content_hash,
     mtimeMs: version.mtime_ms === null ? undefined : Number(version.mtime_ms),
     ctimeMs: version.ctime_ms === null ? undefined : Number(version.ctime_ms),
-    operationTimeMs:
-      version.operation_time_ms === null
-        ? Number(version.created_at.getTime())
-        : Number(version.operation_time_ms)
+    operationTimeMs: Number(version.operation_time_ms)
   };
 }
 
@@ -382,23 +418,6 @@ async function isNoopUpdate(vaultId: string, change: SyncChangeInput): Promise<b
 
   const latestContentHash = await fetchLatestContentHash({ query }, change.fileId);
   return latestContentHash === change.contentHash;
-}
-
-function isLocalOperationNewerThanRemote(
-  change: SyncChangeInput,
-  remoteMetadata: { operationTimeMs?: number; mtimeMs?: number }
-): boolean {
-  const localOperationTimeMs = change.operationTimeMs ?? change.mtimeMs;
-  const remoteOperationTimeMs = remoteMetadata.operationTimeMs ?? remoteMetadata.mtimeMs;
-  return (
-    typeof localOperationTimeMs === "number" &&
-    typeof remoteOperationTimeMs === "number" &&
-    localOperationTimeMs > remoteOperationTimeMs
-  );
-}
-
-function resolveOperationTimeMs(change: SyncChangeInput): number {
-  return change.operationTimeMs ?? change.mtimeMs ?? Date.now();
 }
 
 function parseVaultParams(
@@ -451,6 +470,87 @@ export default function syncRoutes(objectStore: ObjectStore) {
       });
     });
 
+    app.get("/vaults/:vaultId/sync/snapshot", async (request, reply) => {
+      const auth = await requireAuth(request, reply);
+      if (!auth) return;
+
+      const params = parseVaultParams(request, reply);
+      if (!params) return;
+      const { vaultId } = params;
+      if (!(await assertVaultOwnership(vaultId, auth.userId))) {
+        return reply.code(404).send({ code: "VAULT_NOT_FOUND", message: "vault not found" });
+      }
+
+      await ensureCheckpointRow(vaultId);
+      const snapshot = await withTransaction(async (client) => {
+        // 与 commit 共用 checkpoint 行锁，保证 manifest 与返回的 checkpoint 属于同一状态。
+        const checkpointResult = await client.query<CheckpointRow>(
+          `SELECT latest_checkpoint
+           FROM vault_sync_state
+           WHERE vault_id = $1
+           FOR SHARE`,
+          [vaultId]
+        );
+        const filesResult = await client.query<SnapshotFileRow>(
+          `SELECT file_entry.id AS file_id,
+                  file_entry.current_path AS path,
+                  file_entry.head_version AS version,
+                  file_version.content_hash,
+                  file_version.mtime_ms,
+                  file_version.ctime_ms,
+                  file_version.operation_time_ms
+           FROM file_entries AS file_entry
+           JOIN file_versions AS file_version
+             ON file_version.file_id = file_entry.id
+            AND file_version.version = file_entry.head_version
+           WHERE file_entry.vault_id = $1
+             AND file_entry.deleted_at IS NULL
+           ORDER BY file_entry.current_path ASC, file_entry.id ASC`,
+          [vaultId]
+        );
+        const deletedFilesResult = await client.query<SnapshotFileRow>(
+          `SELECT file_entry.id AS file_id,
+                  file_entry.current_path AS path,
+                  file_entry.head_version AS version,
+                  file_version.content_hash,
+                  file_version.mtime_ms,
+                  file_version.ctime_ms,
+                  file_version.operation_time_ms
+           FROM file_entries AS file_entry
+           JOIN file_versions AS file_version
+             ON file_version.file_id = file_entry.id
+            AND file_version.version = file_entry.head_version
+           WHERE file_entry.vault_id = $1
+             AND file_entry.deleted_at IS NOT NULL
+           ORDER BY file_entry.current_path ASC, file_entry.id ASC`,
+          [vaultId]
+        );
+        return {
+          checkpoint: Number(checkpointResult.rows[0]?.latest_checkpoint ?? 0),
+          files: filesResult.rows,
+          deletedFiles: deletedFilesResult.rows
+        };
+      });
+
+      return reply.send({
+        checkpoint: `cp_${snapshot.checkpoint}`,
+        files: snapshot.files.map(toSnapshotFile),
+        deletedFiles: snapshot.deletedFiles.map(toSnapshotFile)
+      });
+
+      function toSnapshotFile(file: SnapshotFileRow) {
+        return {
+          fileId: file.file_id,
+          path: file.path,
+          version: file.version,
+          contentHash: file.content_hash,
+          mtimeMs: file.mtime_ms === null ? undefined : Number(file.mtime_ms),
+          ctimeMs: file.ctime_ms === null ? undefined : Number(file.ctime_ms),
+          operationTimeMs: Number(file.operation_time_ms)
+        };
+      }
+    });
+
     app.post("/vaults/:vaultId/sync/prepare", async (request, reply) => {
       const auth = await requireAuth(request, reply);
       if (!auth) return;
@@ -486,6 +586,10 @@ export default function syncRoutes(objectStore: ObjectStore) {
           conflicts.push(shapeConflict);
           continue;
         }
+        const normalizedChange: SyncChangeInput = {
+          ...change,
+          operationTimeMs: change.operationTimeMs ?? Date.now()
+        };
 
         if (change.op === "create") {
           const occupiedEntry = await getActiveFileEntryByPath(vaultId, change.path);
@@ -508,7 +612,25 @@ export default function syncRoutes(objectStore: ObjectStore) {
             });
             continue;
           }
-          normalizedChanges.push(change);
+          const tombstone = await getActiveTombstoneByPath(vaultId, change.path);
+          const tombstoneOperationTimeMs = tombstone ? Number(tombstone.operation_time_ms) : undefined;
+          if (
+            tombstoneOperationTimeMs !== undefined &&
+            (change.operationTimeMs === undefined || change.operationTimeMs <= tombstoneOperationTimeMs)
+          ) {
+            conflicts.push({
+              index,
+              code: "PATH_TOMBSTONE_CONFLICT",
+              path: change.path,
+              message: "create operation is not newer than the path tombstone",
+              reason: change.operationTimeMs === undefined ? "missing_operation_time" : "stale_operation_time",
+              remotePath: change.path,
+              remoteDeleted: true,
+              remoteOperationTimeMs: tombstoneOperationTimeMs
+            });
+            continue;
+          }
+          normalizedChanges.push(normalizedChange);
           continue;
         }
 
@@ -537,11 +659,11 @@ export default function syncRoutes(objectStore: ObjectStore) {
           continue;
         }
 
+        const remoteMetadata = await fetchLatestVersionMetadata({ query }, fileEntry.id);
         if (fileEntry.head_version !== change.baseVersion) {
-          const remoteMetadata = await fetchLatestVersionMetadata({ query }, fileEntry.id);
-          if (isLocalOperationNewerThanRemote(change, remoteMetadata)) {
+          if (normalizedChange.operationTimeMs! > remoteMetadata.operationTimeMs) {
             normalizedChanges.push({
-              ...change,
+              ...normalizedChange,
               path: change.op === "update" || change.op === "delete" ? fileEntry.current_path : change.path,
               baseVersion: fileEntry.head_version
             });
@@ -554,6 +676,44 @@ export default function syncRoutes(objectStore: ObjectStore) {
             path: change.path,
             message: `baseVersion ${change.baseVersion} does not match headVersion ${fileEntry.head_version}`,
             reason: "base_version_mismatch",
+            headVersion: fileEntry.head_version,
+            remotePath: fileEntry.current_path,
+            remoteDeleted: false,
+            remoteContentHash: remoteMetadata.contentHash,
+            remoteMtimeMs: remoteMetadata.mtimeMs,
+            remoteCtimeMs: remoteMetadata.ctimeMs,
+            remoteOperationTimeMs: remoteMetadata.operationTimeMs
+          });
+          continue;
+        }
+
+        if (normalizedChange.operationTimeMs! <= remoteMetadata.operationTimeMs) {
+          conflicts.push({
+            index,
+            code: "VERSION_CONFLICT",
+            fileId: change.fileId,
+            path: change.path,
+            message: "operation is not newer than the remote head",
+            reason: "stale_operation_time",
+            headVersion: fileEntry.head_version,
+            remotePath: fileEntry.current_path,
+            remoteDeleted: false,
+            remoteContentHash: remoteMetadata.contentHash,
+            remoteMtimeMs: remoteMetadata.mtimeMs,
+            remoteCtimeMs: remoteMetadata.ctimeMs,
+            remoteOperationTimeMs: remoteMetadata.operationTimeMs
+          });
+          continue;
+        }
+
+        if ((change.op === "update" || change.op === "delete") && change.path !== fileEntry.current_path) {
+          conflicts.push({
+            index,
+            code: "VERSION_CONFLICT",
+            fileId: change.fileId,
+            path: change.path,
+            message: "path does not match the remote head",
+            reason: "remote_path_mismatch",
             headVersion: fileEntry.head_version,
             remotePath: fileEntry.current_path,
             remoteDeleted: false,
@@ -590,7 +750,7 @@ export default function syncRoutes(objectStore: ObjectStore) {
           continue;
         }
 
-        normalizedChanges.push(change);
+        normalizedChanges.push(normalizedChange);
       }
 
       const uploadTargets = await resolveUploadTargets(normalizedChanges, objectStore);
@@ -675,7 +835,14 @@ export default function syncRoutes(objectStore: ObjectStore) {
       }
       if (prepare.status === "conflicted" || prepare.conflicts_json.length > 0) {
         metricsRegistry.incCounter("sync_api_sync_commit_total", { result: "conflicted" });
-        return reply.code(409).send({ code: "VERSION_CONFLICT", message: "prepare has conflicts", conflicts: prepare.conflicts_json });
+        const tombstoneConflict = prepare.conflicts_json.find(
+          (conflict) => conflict.code === "PATH_TOMBSTONE_CONFLICT"
+        );
+        return reply.code(409).send({
+          code: tombstoneConflict?.code ?? "VERSION_CONFLICT",
+          message: "prepare has conflicts",
+          conflicts: prepare.conflicts_json
+        });
       }
       if (new Date(prepare.expires_at).getTime() < Date.now()) {
         await query("UPDATE sync_prepares SET status = 'expired' WHERE id = $1", [prepare.id]);
@@ -741,8 +908,8 @@ export default function syncRoutes(objectStore: ObjectStore) {
             throw new Error("failed to create changeset");
           }
 
-          for (const change of changes) {
-            const operationTimeMs = resolveOperationTimeMs(change);
+          for (const [eventIndex, change] of changes.entries()) {
+            const operationTimeMs = change.operationTimeMs ?? Date.now();
             if (change.op === "create") {
               if (!change.contentHash) {
                 throw new Error("create missing contentHash");
@@ -757,7 +924,34 @@ export default function syncRoutes(objectStore: ObjectStore) {
                 [vaultId, change.path]
               );
               if ((pathExists.rowCount ?? 0) > 0) {
-                throw new Error("create path conflict");
+                throw new SyncCommitConflict("PATH_CONFLICT", "create path already exists", {
+                  path: change.path
+                });
+              }
+              const tombstoneResult = await client.query<TombstoneRow>(
+                `SELECT path, operation_time_ms
+                 FROM tombstones
+                 WHERE vault_id = $1
+                   AND path = $2
+                   AND expire_at > NOW()
+                 ORDER BY operation_time_ms DESC, deleted_at DESC, id DESC
+                 LIMIT 1`,
+                [vaultId, change.path]
+              );
+              const tombstone = tombstoneResult.rows[0];
+              const tombstoneOperationTimeMs = tombstone ? Number(tombstone.operation_time_ms) : undefined;
+              if (
+                tombstoneOperationTimeMs !== undefined &&
+                (change.operationTimeMs === undefined || change.operationTimeMs <= tombstoneOperationTimeMs)
+              ) {
+                throw new SyncCommitConflict(
+                  "PATH_TOMBSTONE_CONFLICT",
+                  "create operation is not newer than the path tombstone",
+                  {
+                    path: change.path,
+                    remoteOperationTimeMs: tombstoneOperationTimeMs
+                  }
+                );
               }
 
               await ensureObjectBlobRow(change.contentHash);
@@ -774,14 +968,30 @@ export default function syncRoutes(objectStore: ObjectStore) {
               }
 
               await client.query(
-                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms, operation_time_ms)
+                `INSERT INTO file_versions
+                   (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms, operation_time_ms)
                  VALUES ($1, 1, $2, $3, $4, $5, $6)`,
                 [fileId, change.contentHash, auth.deviceId, change.mtimeMs, change.ctimeMs, operationTimeMs]
               );
               await client.query(
-                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms, operation_time_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-                [vaultId, changesetId, nextCheckpoint, "create", fileId, change.path, 1, change.contentHash, change.mtimeMs, change.ctimeMs, operationTimeMs]
+                `INSERT INTO change_events
+                   (vault_id, changeset_id, checkpoint, event_index, op, file_id, path, version,
+                    content_hash, mtime_ms, ctime_ms, operation_time_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+                [
+                  vaultId,
+                  changesetId,
+                  nextCheckpoint,
+                  eventIndex,
+                  "create",
+                  fileId,
+                  change.path,
+                  1,
+                  change.contentHash,
+                  change.mtimeMs,
+                  change.ctimeMs,
+                  operationTimeMs
+                ]
               );
               continue;
             }
@@ -800,14 +1010,68 @@ export default function syncRoutes(objectStore: ObjectStore) {
             );
             const file = fileRowResult.rows[0];
             if (!file || file.deleted_at) {
-              throw new Error(`file missing ${change.fileId}`);
+              const remoteMetadata = file ? await fetchLatestVersionMetadata(client, file.id) : null;
+              throw new SyncCommitConflict("FILE_NOT_FOUND", `file missing ${change.fileId}`, {
+                fileId: change.fileId,
+                path: change.path,
+                remoteDeleted: Boolean(file?.deleted_at),
+                ...(file ? { headVersion: file.head_version, remotePath: file.current_path } : {}),
+                ...(remoteMetadata
+                  ? {
+                      remoteContentHash: remoteMetadata.contentHash,
+                      remoteMtimeMs: remoteMetadata.mtimeMs,
+                      remoteCtimeMs: remoteMetadata.ctimeMs,
+                      remoteOperationTimeMs: remoteMetadata.operationTimeMs
+                    }
+                  : {})
+              });
             }
             if (file.head_version !== change.baseVersion) {
-              throw new Error(`version conflict for file ${change.fileId}`);
+              const remoteMetadata = await fetchLatestVersionMetadata(client, file.id);
+              throw new SyncCommitConflict("VERSION_CONFLICT", `version conflict for file ${change.fileId}`, {
+                fileId: change.fileId,
+                path: change.path,
+                headVersion: file.head_version,
+                remotePath: file.current_path,
+                remoteDeleted: false,
+                remoteContentHash: remoteMetadata.contentHash,
+                remoteMtimeMs: remoteMetadata.mtimeMs,
+                remoteCtimeMs: remoteMetadata.ctimeMs,
+                remoteOperationTimeMs: remoteMetadata.operationTimeMs
+              });
+            }
+
+            if ((change.op === "update" || change.op === "delete") && change.path !== file.current_path) {
+              const remoteMetadata = await fetchLatestVersionMetadata(client, file.id);
+              throw new SyncCommitConflict("VERSION_CONFLICT", "path does not match the remote head", {
+                fileId: change.fileId,
+                path: change.path,
+                headVersion: file.head_version,
+                remotePath: file.current_path,
+                remoteDeleted: false,
+                remoteContentHash: remoteMetadata.contentHash,
+                remoteMtimeMs: remoteMetadata.mtimeMs,
+                remoteCtimeMs: remoteMetadata.ctimeMs,
+                remoteOperationTimeMs: remoteMetadata.operationTimeMs
+              });
             }
 
             const nextVersion = file.head_version + 1;
-            const currentHash = await fetchLatestContentHash(client, file.id);
+            const currentMetadata = await fetchLatestVersionMetadata(client, file.id);
+            if (operationTimeMs <= currentMetadata.operationTimeMs) {
+              throw new SyncCommitConflict("VERSION_CONFLICT", "operation is not newer than the remote head", {
+                fileId: change.fileId,
+                path: change.path,
+                headVersion: file.head_version,
+                remotePath: file.current_path,
+                remoteDeleted: false,
+                remoteContentHash: currentMetadata.contentHash,
+                remoteMtimeMs: currentMetadata.mtimeMs,
+                remoteCtimeMs: currentMetadata.ctimeMs,
+                remoteOperationTimeMs: currentMetadata.operationTimeMs
+              });
+            }
+            const currentHash = currentMetadata.contentHash;
 
             if (change.op === "update") {
               if (!change.contentHash) {
@@ -822,14 +1086,38 @@ export default function syncRoutes(objectStore: ObjectStore) {
                 [nextVersion, change.path, file.id]
               );
               await client.query(
-                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms, operation_time_ms)
+                `INSERT INTO file_versions
+                   (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms, operation_time_ms)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-                [file.id, nextVersion, change.contentHash, auth.deviceId, change.mtimeMs, change.ctimeMs, operationTimeMs]
+                [
+                  file.id,
+                  nextVersion,
+                  change.contentHash,
+                  auth.deviceId,
+                  change.mtimeMs,
+                  change.ctimeMs,
+                  operationTimeMs
+                ]
               );
               await client.query(
-                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms, operation_time_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-                [vaultId, changesetId, nextCheckpoint, "update", file.id, change.path, nextVersion, change.contentHash, change.mtimeMs, change.ctimeMs, operationTimeMs]
+                `INSERT INTO change_events
+                   (vault_id, changeset_id, checkpoint, event_index, op, file_id, path, version,
+                    content_hash, mtime_ms, ctime_ms, operation_time_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+                [
+                  vaultId,
+                  changesetId,
+                  nextCheckpoint,
+                  eventIndex,
+                  "update",
+                  file.id,
+                  change.path,
+                  nextVersion,
+                  change.contentHash,
+                  change.mtimeMs,
+                  change.ctimeMs,
+                  operationTimeMs
+                ]
               );
               continue;
             }
@@ -842,19 +1130,35 @@ export default function syncRoutes(objectStore: ObjectStore) {
                 [nextVersion, file.id]
               );
               await client.query(
-                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms, operation_time_ms)
+                `INSERT INTO file_versions
+                   (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms, operation_time_ms)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)`,
                 [file.id, nextVersion, currentHash, auth.deviceId, change.mtimeMs, change.ctimeMs, operationTimeMs]
               );
               await client.query(
-                `INSERT INTO tombstones (vault_id, file_id, deleted_at, expire_at)
-                 VALUES ($1, $2, NOW(), NOW() + ($3 * INTERVAL '1 day'))`,
-                [vaultId, file.id, appConfig.tombstoneRetentionDays]
+                `INSERT INTO tombstones (vault_id, file_id, path, operation_time_ms, deleted_at, expire_at)
+                 VALUES ($1, $2, $3, $4, NOW(), NOW() + ($5 * INTERVAL '1 day'))`,
+                [vaultId, file.id, file.current_path, operationTimeMs, appConfig.tombstoneRetentionDays]
               );
               await client.query(
-                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms, operation_time_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-                [vaultId, changesetId, nextCheckpoint, "delete", file.id, file.current_path, nextVersion, currentHash, change.mtimeMs, change.ctimeMs, operationTimeMs]
+                `INSERT INTO change_events
+                   (vault_id, changeset_id, checkpoint, event_index, op, file_id, path, version,
+                    content_hash, mtime_ms, ctime_ms, operation_time_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+                [
+                  vaultId,
+                  changesetId,
+                  nextCheckpoint,
+                  eventIndex,
+                  "delete",
+                  file.id,
+                  file.current_path,
+                  nextVersion,
+                  currentHash,
+                  change.mtimeMs,
+                  change.ctimeMs,
+                  operationTimeMs
+                ]
               );
               continue;
             }
@@ -871,7 +1175,10 @@ export default function syncRoutes(objectStore: ObjectStore) {
                 [vaultId, change.path, file.id]
               );
               if ((collision.rowCount ?? 0) > 0) {
-                throw new Error(`path conflict for ${change.path}`);
+                throw new SyncCommitConflict("PATH_CONFLICT", `path conflict for ${change.path}`, {
+                  fileId: change.fileId,
+                  path: change.path
+                });
               }
 
               await client.query(
@@ -881,14 +1188,30 @@ export default function syncRoutes(objectStore: ObjectStore) {
                 [nextVersion, change.path, file.id]
               );
               await client.query(
-                `INSERT INTO file_versions (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms, operation_time_ms)
+                `INSERT INTO file_versions
+                   (file_id, version, content_hash, author_device_id, mtime_ms, ctime_ms, operation_time_ms)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)`,
                 [file.id, nextVersion, currentHash, auth.deviceId, change.mtimeMs, change.ctimeMs, operationTimeMs]
               );
               await client.query(
-                `INSERT INTO change_events (vault_id, changeset_id, checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms, operation_time_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-                [vaultId, changesetId, nextCheckpoint, change.op, file.id, change.path, nextVersion, currentHash, change.mtimeMs, change.ctimeMs, operationTimeMs]
+                `INSERT INTO change_events
+                   (vault_id, changeset_id, checkpoint, event_index, op, file_id, path, version,
+                    content_hash, mtime_ms, ctime_ms, operation_time_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+                [
+                  vaultId,
+                  changesetId,
+                  nextCheckpoint,
+                  eventIndex,
+                  change.op,
+                  file.id,
+                  change.path,
+                  nextVersion,
+                  currentHash,
+                  change.mtimeMs,
+                  change.ctimeMs,
+                  operationTimeMs
+                ]
               );
               continue;
             }
@@ -930,6 +1253,13 @@ export default function syncRoutes(objectStore: ObjectStore) {
       } catch (error) {
         request.log.error({ err: error }, "sync commit failed");
         metricsRegistry.incCounter("sync_api_sync_commit_total", { result: "failed" });
+        if (error instanceof SyncCommitConflict) {
+          return reply.code(409).send({
+            code: error.code,
+            message: error.message,
+            ...error.details
+          });
+        }
         const message =
           appConfig.env === "development" && error instanceof Error
             ? error.message
@@ -968,27 +1298,51 @@ export default function syncRoutes(objectStore: ObjectStore) {
       }
 
       const limit = parsed.data.limit ?? 200;
-      const result = await query<ChangeEventRow>(
-        `SELECT checkpoint, op, file_id, path, version, content_hash, mtime_ms, ctime_ms, operation_time_ms, source, reason, admin_operation_id
+      // checkpoint 是不可拆分的提交单元；limit 只用于选择最后一个完整 checkpoint。
+      const boundaryResult = await query<{ checkpoint: string }>(
+        `SELECT checkpoint
          FROM change_events
          WHERE vault_id = $1
            AND checkpoint > $2
-         ORDER BY checkpoint ASC, created_at ASC
-         LIMIT $3`,
-        [vaultId, parsed.data.fromCheckpoint, limit + 1]
+           AND checkpoint <= $3
+         ORDER BY checkpoint ASC, event_index ASC
+         OFFSET $4
+         LIMIT 1`,
+        [vaultId, parsed.data.fromCheckpoint, latestCheckpoint, limit - 1]
+      );
+      const boundaryCheckpoint = boundaryResult.rows[0]
+        ? Number(boundaryResult.rows[0].checkpoint)
+        : latestCheckpoint;
+      const result = await query<ChangeEventRow>(
+        `SELECT checkpoint, event_index, op, file_id, path, version, content_hash,
+                mtime_ms, ctime_ms, operation_time_ms, source, reason, admin_operation_id
+         FROM change_events
+         WHERE vault_id = $1
+           AND checkpoint > $2
+           AND checkpoint <= $3
+         ORDER BY checkpoint ASC, event_index ASC`,
+        [vaultId, parsed.data.fromCheckpoint, boundaryCheckpoint]
       );
 
-      const hasMore = result.rows.length > limit;
-      const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
-      const toCheckpoint =
-        rows.length > 0 ? Number(rows[rows.length - 1]!.checkpoint) : parsed.data.fromCheckpoint;
+      const moreResult = await query<{ has_more: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1
+           FROM change_events
+           WHERE vault_id = $1
+             AND checkpoint > $2
+             AND checkpoint <= $3
+         ) AS has_more`,
+        [vaultId, boundaryCheckpoint, latestCheckpoint]
+      );
+      const hasMore = moreResult.rows[0]?.has_more ?? false;
+      const toCheckpoint = hasMore ? boundaryCheckpoint : latestCheckpoint;
       metricsRegistry.incCounter("sync_api_sync_pull_total", { result: "success" });
-      metricsRegistry.incCounter("sync_api_sync_pull_changes_total", {}, rows.length);
+      metricsRegistry.incCounter("sync_api_sync_pull_changes_total", {}, result.rows.length);
 
       return reply.send({
         fromCheckpoint: `cp_${parsed.data.fromCheckpoint}`,
         toCheckpoint: `cp_${toCheckpoint}`,
-        changes: rows.map((row) => ({
+        changes: result.rows.map((row) => ({
           op: row.op,
           fileId: row.file_id,
           path: row.path,
@@ -996,7 +1350,7 @@ export default function syncRoutes(objectStore: ObjectStore) {
           contentHash: row.content_hash,
           mtimeMs: row.mtime_ms === null ? undefined : Number(row.mtime_ms),
           ctimeMs: row.ctime_ms === null ? undefined : Number(row.ctime_ms),
-          operationTimeMs: row.operation_time_ms === null ? undefined : Number(row.operation_time_ms),
+          operationTimeMs: Number(row.operation_time_ms),
           source: row.source ?? "device",
           reason: row.reason ?? undefined,
           adminOperationId: row.admin_operation_id ?? undefined
