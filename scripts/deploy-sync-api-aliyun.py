@@ -97,44 +97,54 @@ REMOTE_DIR={remote_dir}
 REMOTE_ARCHIVE={remote_archive_q}
 RUN_DIR="$REMOTE_DIR/run"
 LOG_DIR="$REMOTE_DIR/logs"
+SYSTEMD_UNIT="obsidian-sync-api.service"
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 chown -R {remote_user}:{remote_user} "$REMOTE_DIR"
 su - {remote_user} -c 'mkdir -p "$HOME"/obsidianSync'
 rm -rf "$REMOTE_DIR/apps/sync-api/src" "$REMOTE_DIR/apps/sync-api/migrations" "$REMOTE_DIR/apps/admin" "$REMOTE_DIR/packages/shared/src"
 su - {remote_user} -c 'tar xzf {remote_archive_q} -C {remote_dir}'
 su - {remote_user} -c 'cd {remote_dir} && npm install && npm run --workspace @obsidian-sync/shared build && npm run --workspace @obsidian-sync/admin build && npm run --workspace @obsidian-sync/sync-api build && npm run migrate' 
-if [ -f "$RUN_DIR/sync-api.pid" ]; then
-  PID="$(cat "$RUN_DIR/sync-api.pid" || true)"
-  if [ -n "$PID" ]; then
-    kill "$PID" 2>/dev/null || true
+if systemctl cat "$SYSTEMD_UNIT" >/dev/null 2>&1; then
+  systemctl restart "$SYSTEMD_UNIT"
+else
+  if [ -f "$RUN_DIR/sync-api.pid" ]; then
+    PID="$(cat "$RUN_DIR/sync-api.pid" || true)"
+    if [ -n "$PID" ]; then
+      kill "$PID" 2>/dev/null || true
+    fi
   fi
+  for _ in $(seq 1 15); do
+    if ! ss -ltn | grep -q ':3000 '; then
+      break
+    fi
+    sleep 1
+  done
+  if ss -ltn | grep -q ':3000 '; then
+    PIDS="$(ss -ltnp | awk -F'pid=' '/:3000 /{{split($2,a,","); print a[1]}}' | sort -u | tr '\n' ' ')"
+    if [ -n "$PIDS" ]; then
+      echo "stopping stale sync-api listener pids: $PIDS"
+      kill $PIDS 2>/dev/null || true
+    fi
+  fi
+  for _ in $(seq 1 10); do
+    if ! ss -ltn | grep -q ':3000 '; then
+      break
+    fi
+    sleep 1
+  done
+  if ss -ltn | grep -q ':3000 '; then
+    echo "port 3000 is still busy after stale listener stop attempt" >&2
+    ss -ltnp | grep ':3000 ' >&2 || true
+    exit 1
+  fi
+  su - {remote_user} -c 'cd {remote_dir}/apps/sync-api && setsid -f /usr/bin/node dist/index.js >> {remote_dir}/logs/sync-api.log 2>&1 < /dev/null'
 fi
-for _ in $(seq 1 15); do
-  if ! ss -ltn | grep -q ':3000 '; then
+for _ in $(seq 1 20); do
+  if curl -fsS {ready_url} >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-if ss -ltn | grep -q ':3000 '; then
-  PIDS="$(ss -ltnp | awk -F'pid=' '/:3000 /{{split($2,a,","); print a[1]}}' | sort -u | tr '\n' ' ')"
-  if [ -n "$PIDS" ]; then
-    echo "stopping stale sync-api listener pids: $PIDS"
-    kill $PIDS 2>/dev/null || true
-  fi
-fi
-for _ in $(seq 1 10); do
-  if ! ss -ltn | grep -q ':3000 '; then
-    break
-  fi
-  sleep 1
-done
-if ss -ltn | grep -q ':3000 '; then
-  echo "port 3000 is still busy after stale listener stop attempt" >&2
-  ss -ltnp | grep ':3000 ' >&2 || true
-  exit 1
-fi
-su - {remote_user} -c 'cd {remote_dir}/apps/sync-api && setsid /usr/bin/node dist/index.js >> {remote_dir}/logs/sync-api.log 2>&1 < /dev/null &'
-sleep 2
 NODE_PID="$(ss -ltnp | awk -F'pid=' '/:3000 /{{split($2,a,","); print a[1]; exit}}')"
 if [ -z "$NODE_PID" ]; then
   echo "sync-api did not start listening on port 3000" >&2
@@ -145,6 +155,15 @@ echo "$NODE_PID" > "$RUN_DIR/sync-api.pid"
 curl -fsS {health_url}
 echo
 curl -fsS {ready_url}
+echo
+if systemctl cat "$SYSTEMD_UNIT" >/dev/null 2>&1; then
+  SYSTEMD_PID="$(systemctl show "$SYSTEMD_UNIT" -p MainPID --value)"
+  if [ "$NODE_PID" != "$SYSTEMD_PID" ]; then
+    echo "listener pid $NODE_PID does not match systemd main pid $SYSTEMD_PID" >&2
+    exit 1
+  fi
+  echo "SYSTEMD_UNIT=$SYSTEMD_UNIT SYSTEMD_MAIN_PID=$SYSTEMD_PID"
+fi
 rm -f "$REMOTE_ARCHIVE"
 """
     ok, output = client.execute_raw(remote_cmd)

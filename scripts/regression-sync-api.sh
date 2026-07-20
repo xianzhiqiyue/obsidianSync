@@ -31,6 +31,7 @@ assert_true() {
 }
 
 health=$(curl -sS "$BASE_URL/health")
+operation_base_ms=$(node -e 'process.stdout.write(String(Date.now()));')
 
 login_a=$(curl -sS -X POST "$BASE_URL/auth/login" \
   -H "content-type: application/json" \
@@ -57,7 +58,7 @@ cp0=$(checkpoint_to_num "$(node -e 'const j=JSON.parse(process.argv[1]); process
 # Step 1: device A creates notes/conflict.md
 content_a1="reg-conflict-create-$(date +%s)-$(new_uuid)"
 hash_a1=$(hash_content "$content_a1")
-payload_create=$(node -e 'const cp=Number(process.argv[1]); const hash=process.argv[2]; process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "create", path: "notes/conflict.md", contentHash: hash}]}));' "$cp0" "$hash_a1")
+payload_create=$(node -e 'const cp=Number(process.argv[1]); const hash=process.argv[2]; const operationTimeMs=Number(process.argv[3]); process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "create", path: "notes/conflict.md", contentHash: hash, operationTimeMs}]}));' "$cp0" "$hash_a1" "$operation_base_ms")
 prepare_create=$(curl -sS -X POST "$BASE_URL/vaults/$vault_id/sync/prepare" \
   -H "authorization: Bearer $token_a" \
   -H "content-type: application/json" \
@@ -85,7 +86,7 @@ version_after_create=$(node -e 'const j=JSON.parse(process.argv[1]); const c=(j.
 # Step 2: device B updates same file, committing version+1
 content_b2="reg-conflict-update-$(date +%s)-$(new_uuid)"
 hash_b2=$(hash_content "$content_b2")
-payload_update_b=$(node -e 'const cp=Number(process.argv[1]); const fileId=process.argv[2]; const baseVersion=Number(process.argv[3]); const hash=process.argv[4]; process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "update", fileId, path: "notes/conflict.md", baseVersion, contentHash: hash}]}));' "$cp_after_create" "$file_id" "$version_after_create" "$hash_b2")
+payload_update_b=$(node -e 'const cp=Number(process.argv[1]); const fileId=process.argv[2]; const baseVersion=Number(process.argv[3]); const hash=process.argv[4]; const operationTimeMs=Number(process.argv[5]); process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "update", fileId, path: "notes/conflict.md", baseVersion, contentHash: hash, operationTimeMs}]}));' "$cp_after_create" "$file_id" "$version_after_create" "$hash_b2" "$((operation_base_ms + 100))")
 prepare_update_b=$(curl -sS -X POST "$BASE_URL/vaults/$vault_id/sync/prepare" \
   -H "authorization: Bearer $token_b" \
   -H "content-type: application/json" \
@@ -110,7 +111,7 @@ version_after_update_b=$(node -e 'const j=JSON.parse(process.argv[1]); const c=(
 # Step 3: device A retries stale update with old baseVersion -> VERSION_CONFLICT
 content_a2="reg-stale-update-$(date +%s)-$(new_uuid)"
 hash_a2=$(hash_content "$content_a2")
-payload_stale_update_a=$(node -e 'const cp=Number(process.argv[1]); const fileId=process.argv[2]; const staleVersion=Number(process.argv[3]); const hash=process.argv[4]; process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "update", fileId, path: "notes/conflict.md", baseVersion: staleVersion, contentHash: hash}]}));' "$cp_after_update_b" "$file_id" "$version_after_create" "$hash_a2")
+payload_stale_update_a=$(node -e 'const cp=Number(process.argv[1]); const fileId=process.argv[2]; const staleVersion=Number(process.argv[3]); const hash=process.argv[4]; const operationTimeMs=Number(process.argv[5]); process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "update", fileId, path: "notes/conflict.md", baseVersion: staleVersion, contentHash: hash, operationTimeMs}]}));' "$cp_after_update_b" "$file_id" "$version_after_create" "$hash_a2" "$((operation_base_ms + 50))")
 prepare_stale_update_a=$(curl -sS -X POST "$BASE_URL/vaults/$vault_id/sync/prepare" \
   -H "authorization: Bearer $token_a" \
   -H "content-type: application/json" \
@@ -120,7 +121,7 @@ has_version_conflict=$(node -e 'const j=JSON.parse(process.argv[1]); const ok=Ar
 assert_true "$has_version_conflict" "stale update must return VERSION_CONFLICT in prepare"
 
 # Step 4: rename should keep fileId and produce rename/move event
-payload_rename_b=$(node -e 'const cp=Number(process.argv[1]); const fileId=process.argv[2]; const baseVersion=Number(process.argv[3]); process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "rename", fileId, path: "notes/conflict-renamed.md", baseVersion}]}));' "$cp_after_update_b" "$file_id" "$version_after_update_b")
+payload_rename_b=$(node -e 'const cp=Number(process.argv[1]); const fileId=process.argv[2]; const baseVersion=Number(process.argv[3]); const operationTimeMs=Number(process.argv[4]); process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "rename", fileId, path: "notes/conflict-renamed.md", baseVersion, operationTimeMs}]}));' "$cp_after_update_b" "$file_id" "$version_after_update_b" "$((operation_base_ms + 200))")
 prepare_rename_b=$(curl -sS -X POST "$BASE_URL/vaults/$vault_id/sync/prepare" \
   -H "authorization: Bearer $token_b" \
   -H "content-type: application/json" \
@@ -141,7 +142,7 @@ assert_true "$rename_event_ok" "rename event missing or fileId changed"
 # Step 5: commit idempotency replay returns same response
 content_idempotency="reg-idempotency-$(date +%s)-$(new_uuid)"
 hash_idempotency=$(hash_content "$content_idempotency")
-payload_create_idempotency=$(node -e 'const cp=Number(process.argv[1]); const hash=process.argv[2]; process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "create", path: "notes/idempotency.md", contentHash: hash}]}));' "$cp_after_rename_b" "$hash_idempotency")
+payload_create_idempotency=$(node -e 'const cp=Number(process.argv[1]); const hash=process.argv[2]; const operationTimeMs=Number(process.argv[3]); process.stdout.write(JSON.stringify({baseCheckpoint: cp, changes: [{op: "create", path: "notes/idempotency.md", contentHash: hash, operationTimeMs}]}));' "$cp_after_rename_b" "$hash_idempotency" "$((operation_base_ms + 300))")
 prepare_idempotency=$(curl -sS -X POST "$BASE_URL/vaults/$vault_id/sync/prepare" \
   -H "authorization: Bearer $token_a" \
   -H "content-type: application/json" \

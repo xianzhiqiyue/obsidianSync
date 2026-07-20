@@ -31,7 +31,7 @@ base_cp=$(node -e 'const j=JSON.parse(process.argv[1]); const cp=(j.checkpoint |
 content="smoke-content-$(date +%s)"
 content_hash="$(printf '%s' "$content" | sha256sum | awk '{print "sha256:"$1}')"
 
-prepare_payload=$(node -e 'const cp=Number(process.argv[1]); const now=Date.now(); const hash=process.argv[2]; const body={baseCheckpoint:cp,changes:[{op:"create",path:"notes/smoke.md",contentHash:hash}]}; process.stdout.write(JSON.stringify(body));' "$base_cp" "$content_hash")
+prepare_payload=$(node -e 'const cp=Number(process.argv[1]); const hash=process.argv[2]; const body={baseCheckpoint:cp,changes:[{op:"create",path:"notes/smoke.md",contentHash:hash,operationTimeMs:Date.now()}]}; process.stdout.write(JSON.stringify(body));' "$base_cp" "$content_hash")
 
 prepare=$(curl -sS -X POST "$BASE_URL/vaults/$vault_id/sync/prepare" \
   -H "authorization: Bearer $access" \
