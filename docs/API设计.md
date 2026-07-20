@@ -298,7 +298,7 @@
 }
 ```
 
-`files` 返回活动文件，`deletedFiles` 返回持久删除证据；两者与 checkpoint 处于同一个一致性边界。
+`files` 返回活动文件，`deletedFiles` 仅返回没有同路径活动文件覆盖的每路径最新删除证据；两者与 checkpoint 处于同一个一致性边界。客户端处理历史删除证据时必须优先识别同路径活动文件，不能把不同 `fileId` 的当前文件误判为被删文件。
 
 ### 4.6 获取下载地址
 - `POST /vaults/{vaultId}/objects/download-urls`

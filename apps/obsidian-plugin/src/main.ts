@@ -11,7 +11,8 @@ import {
   decidePendingDelete,
   decideRemoteFileChange,
   findPendingDeleteMarker,
-  inferMissingMaterializedDelete
+  inferMissingMaterializedDelete,
+  resolveDeletedBaselineEntry
 } from "./delete-reconciliation";
 import {
   formatActivitySummary,
@@ -799,7 +800,11 @@ export default class CustomSyncPlugin extends Plugin {
       for (const deleted of deletedFiles) {
         this.throwIfAborted(signal);
         if (!this.shouldSyncPath(deleted.path).sync) continue;
-        const previous = previousByFileId.get(deleted.fileId) ?? previousIndex[deleted.path];
+        const previous = resolveDeletedBaselineEntry({
+          activeRemoteEntry: remoteIndex[deleted.path],
+          previousByFileId: previousByFileId.get(deleted.fileId),
+          previousByPath: previousIndex[deleted.path]
+        });
         if (previous?.materialized !== true) continue;
         const marker = findPendingDeleteMarker(this.stateStore.getLocalDeleteMarkers(), deleted);
         if (marker && decidePendingDelete(marker, deleted.operationTimeMs) === "keep_local_delete") {

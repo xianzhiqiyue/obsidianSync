@@ -38,6 +38,16 @@ export function inferMissingMaterializedDelete(
   };
 }
 
+export function resolveDeletedBaselineEntry(input: {
+  activeRemoteEntry?: IndexedFileState;
+  previousByFileId?: IndexedFileState;
+  previousByPath?: IndexedFileState;
+}): IndexedFileState | undefined {
+  // 同路径已有活动文件时，历史墓碑不能覆盖当前文件身份。
+  if (input.activeRemoteEntry) return undefined;
+  return input.previousByFileId ?? input.previousByPath;
+}
+
 export type RemoteFileDecision = "keep_local" | "accept_remote";
 
 export function decideRemoteFileChange(input: {

@@ -509,7 +509,8 @@ export default function syncRoutes(objectStore: ObjectStore) {
           [vaultId]
         );
         const deletedFilesResult = await client.query<SnapshotFileRow>(
-          `SELECT file_entry.id AS file_id,
+          `SELECT DISTINCT ON (file_entry.current_path)
+                  file_entry.id AS file_id,
                   file_entry.current_path AS path,
                   file_entry.head_version AS version,
                   file_version.content_hash,
@@ -522,7 +523,16 @@ export default function syncRoutes(objectStore: ObjectStore) {
             AND file_version.version = file_entry.head_version
            WHERE file_entry.vault_id = $1
              AND file_entry.deleted_at IS NOT NULL
-           ORDER BY file_entry.current_path ASC, file_entry.id ASC`,
+             AND NOT EXISTS (
+               SELECT 1
+               FROM file_entries AS active_entry
+               WHERE active_entry.vault_id = file_entry.vault_id
+                 AND active_entry.current_path = file_entry.current_path
+                 AND active_entry.deleted_at IS NULL
+             )
+           ORDER BY file_entry.current_path ASC,
+                    file_version.operation_time_ms DESC,
+                    file_entry.id DESC`,
           [vaultId]
         );
         return {

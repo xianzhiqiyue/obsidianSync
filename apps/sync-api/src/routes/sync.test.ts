@@ -980,8 +980,40 @@ test("delete commit should persist tombstone and only allow a newer create", asy
       "SELECT id FROM file_entries WHERE vault_id = $1 AND current_path = $2 AND deleted_at IS NULL",
       [context.vaultId, path]
     );
-    assert.ok(recreatedFileResult.rows[0]?.id);
-    assert.notEqual(recreatedFileResult.rows[0]?.id, deletedFileId);
+    const recreatedFileId = recreatedFileResult.rows[0]?.id;
+    assert.ok(recreatedFileId);
+    assert.notEqual(recreatedFileId, deletedFileId);
+
+    const snapshotResponse = await context.app.inject({
+      method: "GET",
+      url: `/api/v1/vaults/${context.vaultId}/sync/snapshot`,
+      headers: { authorization: `Bearer ${context.accessToken}` }
+    });
+    assert.equal(snapshotResponse.statusCode, 200);
+    assert.equal(snapshotResponse.json().files[0]?.fileId, recreatedFileId);
+    assert.equal(snapshotResponse.json().files[0]?.path, path);
+    assert.deepEqual(snapshotResponse.json().deletedFiles, []);
+
+    const recreatedDeletePrepare = await prepareChanges(context, 3, [
+      {
+        op: "delete",
+        fileId: recreatedFileId,
+        path,
+        baseVersion: 1,
+        operationTimeMs: 4000
+      }
+    ]);
+    await commitPrepare(context, recreatedDeletePrepare.prepareId);
+    const deletedSnapshotResponse = await context.app.inject({
+      method: "GET",
+      url: `/api/v1/vaults/${context.vaultId}/sync/snapshot`,
+      headers: { authorization: `Bearer ${context.accessToken}` }
+    });
+    assert.equal(deletedSnapshotResponse.statusCode, 200);
+    assert.deepEqual(deletedSnapshotResponse.json().files, []);
+    assert.equal(deletedSnapshotResponse.json().deletedFiles.length, 1);
+    assert.equal(deletedSnapshotResponse.json().deletedFiles[0]?.fileId, recreatedFileId);
+    assert.equal(deletedSnapshotResponse.json().deletedFiles[0]?.operationTimeMs, 4000);
   } finally {
     await destroyTestContext(context);
     await cleanupObjectHashes([originalHash, recreatedHash]);

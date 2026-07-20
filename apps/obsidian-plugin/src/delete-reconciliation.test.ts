@@ -4,7 +4,8 @@ import {
   decidePendingDelete,
   decideRemoteFileChange,
   findPendingDeleteMarker,
-  inferMissingMaterializedDelete
+  inferMissingMaterializedDelete,
+  resolveDeletedBaselineEntry
 } from "./delete-reconciliation";
 
 const marker = {
@@ -39,6 +40,24 @@ test("inferMissingMaterializedDelete only infers deletion for a file that landed
   assert.deepEqual(inferMissingMaterializedDelete(indexed, false, 300), { ...marker, ts: 300 });
   assert.equal(inferMissingMaterializedDelete({ ...indexed, materialized: false }, false, 300), undefined);
   assert.equal(inferMissingMaterializedDelete(indexed, true, 300), undefined);
+});
+
+test("resolveDeletedBaselineEntry does not let a historical tombstone replace an active file", () => {
+  const previousByPath = {
+    fileId: "22222222-2222-2222-2222-222222222222",
+    path: marker.path,
+    version: 1,
+    contentHash: "sha256:recreated",
+    materialized: true
+  };
+  assert.equal(
+    resolveDeletedBaselineEntry({
+      activeRemoteEntry: previousByPath,
+      previousByPath
+    }),
+    undefined
+  );
+  assert.equal(resolveDeletedBaselineEntry({ previousByPath }), previousByPath);
 });
 
 test("decideRemoteFileChange preserves only a genuinely newer local content operation", () => {
